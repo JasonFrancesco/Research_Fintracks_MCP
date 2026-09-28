@@ -1,8 +1,17 @@
+import sys
+from pathlib import Path
+
+# Memastikan folder backend terdaftar di sys.path agar uvicorn menemukan modul app
+backend_dir = str(Path(__file__).resolve().parent.parent)
+if backend_dir not in sys.path:
+    sys.path.insert(0, backend_dir)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .routes import auth, transactions, chat
-from .database import engine
-from .models.models import Base
+from app.routes import auth, transactions, chat
+from app.database import engine
+from app.models.models import Base
+
 
 # Buat tabel jika belum ada (untuk backup jika manual create gagal)
 Base.metadata.create_all(bind=engine)

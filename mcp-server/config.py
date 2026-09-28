@@ -20,14 +20,17 @@ elif backend_env_path.exists():
 else:
     load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable is not set. Please create a .env file with DATABASE_URL.")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:Admin123@localhost:5432/fintracks")
+MCP_API_KEY = os.getenv("MCP_API_KEY", "default-dev-key-123")
 
-MCP_API_KEY = os.getenv("MCP_API_KEY", "default-dev-key-123") # Use env var in production
-engine = create_engine(DATABASE_URL)
+connect_args = {}
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def get_db_session():
     return SessionLocal()
+
 

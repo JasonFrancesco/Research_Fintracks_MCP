@@ -18,6 +18,7 @@ const Dashboard = () => {
         category: 'Lainnya',
         transaction_type: 'expense',
         transaction_date: new Date().toISOString().split('T')[0],
+        note: ''
     });
     const [editData, setEditData] = useState(null);
 
@@ -239,6 +240,16 @@ const Dashboard = () => {
                                         required
                                     />
                                 </div>
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-1">Catatan (Opsional)</label>
+                                    <textarea
+                                        name="note"
+                                        value={formData.note}
+                                        onChange={handleInputChange}
+                                        className="w-full p-2 border rounded-lg outline-none focus:ring-2 focus:ring-blue-500"
+                                        rows="2"
+                                    ></textarea>
+                                </div>
                                 <div className="flex gap-3 pt-2">
                                     <button
                                         type="button"
@@ -310,7 +321,7 @@ const Dashboard = () => {
                                         name="category"
                                         value={editData.category}
                                         onChange={handleEditInputChange}
-                                        className="w-full p-2 border rounded-lg outline-none focus:ring-2 focus:ring-blue-500"
+                                        className="w-full p-2 border rounded-lg outline-//none focus:ring-2 focus:ring-blue-500"
                                     >
                                         <option value="Makanan & Minuman">Makanan & Minuman</option>
                                         <option value="Transportasi">Transportasi</option>
@@ -329,6 +340,16 @@ const Dashboard = () => {
                                         className="w-full p-2 border rounded-lg outline-none focus:ring-2 focus:ring-blue-500"
                                         required
                                     />
+                                </div>
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-1">Catatan (Opsional)</label>
+                                    <textarea
+                                        name="note"
+                                        value={editData.note}
+                                        onChange={handleEditInputChange}
+                                        className="w-full p-2 border rounded-lg outline-none focus:ring-2 focus:ring-blue-500"
+                                        rows="2"
+                                    ></textarea>
                                 </div>
                                 <div className="flex gap-3 pt-2">
                                     <button

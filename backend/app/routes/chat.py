@@ -1,9 +1,11 @@
 import os
 import re
+import json
 import requests
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from ..auth.dependencies import get_current_user
 from ..models.models import User
 
@@ -15,61 +17,127 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
 
-MCP_SERVER_URL = "http://127.0.0.1:8001/call"
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8001/call")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_URL = f"{OLLAMA_BASE_URL}/api/chat"
 OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "30"))
 
-
 def get_active_model() -> str:
-    """
-    Membaca model AI aktif dari environment variable ACTIVE_MODEL setiap kali
-    dipanggil (bukan konstanta tetap saat startup), sehingga model bisa diganti
-    (misal dari 'ollama/llama3.2' ke 'ollama/gemma:31b' atau model lain apapun
-    yang sudah di-pull di Ollama) hanya dengan mengubah nilai ACTIVE_MODEL di
-    file .env lalu me-restart server backend, tanpa perlu mengubah kode ini.
-
-    Format yang didukung di .env:
-      ACTIVE_MODEL=ollama/llama3.2   -> dipakai sebagai "llama3.2"
-      ACTIVE_MODEL=llama3.2          -> dipakai sebagai "llama3.2" (tanpa prefix juga valid)
-    """
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
     raw = os.getenv("ACTIVE_MODEL", "ollama/llama3.2").strip()
     if not raw:
         raw = "ollama/llama3.2"
     return raw.split("/", 1)[1] if "/" in raw else raw
 
-
-def call_ollama_chat(messages: list, timeout: Optional[float] = None) -> Optional[dict]:
-    """
-    Wrapper terpusat untuk memanggil Ollama chat API menggunakan model aktif
-    yang sedang dikonfigurasi di .env. Mengembalikan None (tanpa melempar
-    exception) bila terjadi kegagalan koneksi, timeout, atau model belum
-    tersedia di Ollama, sehingga pemanggil selalu bisa fallback dengan aman.
-    """
-    model_name = get_active_model()
-    try:
-        payload = {
-            "model": model_name,
-            "messages": messages,
-            "stream": False,
-            "options": {"temperature": 0.7}
+# Skema resmi MCP Tools yang di-expose ke LLM (Sesuai Spesifikasi MCP Function Calling)
+TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_transaction",
+            "description": "Catat transaksi keuangan baru (pemasukan/gaji atau pengeluaran/pembelian) ke dalam database.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Judul atau deskripsi transaksi (contoh: Makan Siang Nasi Goreng, Beli Kopi Starbucks, Gaji Bulanan)."
+                    },
+                    "amount": {
+                        "type": "number",
+                        "description": "Nominal transaksi dalam angka Rupiah tanpa simbol (contoh: 25000 untuk 25 ribu/25k, 1500000 untuk 1.5 juta)."
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Kategori transaksi. Pilih dari: 'Makanan & Minuman', 'Transportasi', 'Belanja', 'Pendapatan', 'Kesehatan', 'Hiburan', 'Tagihan', atau 'Lainnya'."
+                    },
+                    "transaction_type": {
+                        "type": "string",
+                        "enum": ["income", "expense"],
+                        "description": "Jenis transaksi: 'expense' untuk pengeluaran/beli/bayar, 'income' untuk pemasukan/gaji/terima uang."
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Tanggal transaksi format YYYY-MM-DD. Gunakan tanggal hari ini jika pengguna tidak menyebutkan tanggal spesifik."
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Catatan tambahan opsional."
+                    }
+                },
+                "required": ["title", "amount", "category", "transaction_type", "date"]
+            }
         }
-        res = requests.post(OLLAMA_URL, json=payload, timeout=timeout or OLLAMA_TIMEOUT)
-        if res.status_code == 200:
-            return res.json()
-        if res.status_code == 404:
-            print(f"[Ollama] Model '{model_name}' tidak ditemukan. "
-                  f"Jalankan 'ollama pull {model_name}' terlebih dahulu.")
-        else:
-            print(f"[Ollama] Gagal memanggil model '{model_name}': HTTP {res.status_code} - {res.text[:200]}")
-    except requests.exceptions.Timeout:
-        print(f"[Ollama] Timeout memanggil model '{model_name}' (>{timeout or OLLAMA_TIMEOUT}s). "
-              f"Model besar mungkin butuh OLLAMA_TIMEOUT lebih besar di .env.")
-    except requests.exceptions.ConnectionError:
-        print(f"[Ollama] Tidak dapat terhubung ke {OLLAMA_URL}. Pastikan Ollama sedang berjalan.")
-    except Exception as e:
-        print(f"[Ollama] Error tak terduga memanggil model '{model_name}': {e}")
-    return None
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_transactions",
+            "description": "Mengambil riwayat atau daftar transaksi keuangan terbaru milik pengguna.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Jumlah transaksi terbaru yang ingin diambil (default 10)."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_summary",
+            "description": "Mendapatkan ringkasan statistik keuangan (Total Pemasukan, Total Pengeluaran, dan Saldo akhir).",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_transaction",
+            "description": "Mengubah data transaksi yang sudah ada berdasarkan ID transaksi.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "transaction_id": {
+                        "type": "integer",
+                        "description": "ID transaksi numerik yang ingin diubah."
+                    },
+                    "title": {"type": "string", "description": "Judul baru (opsional)"},
+                    "amount": {"type": "number", "description": "Nominal baru (opsional)"},
+                    "category": {"type": "string", "description": "Kategori baru (opsional)"},
+                    "transaction_type": {"type": "string", "enum": ["income", "expense"], "description": "Jenis transaksi baru (opsional)"},
+                    "date": {"type": "string", "description": "Tanggal baru format YYYY-MM-DD (opsional)"},
+                    "note": {"type": "string", "description": "Catatan baru (opsional)"}
+                },
+                "required": ["transaction_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_transaction",
+            "description": "Menghapus catatan transaksi keuangan berdasarkan ID transaksi.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "transaction_id": {
+                        "type": "integer",
+                        "description": "ID transaksi numerik yang ingin dihapus."
+                    }
+                },
+                "required": ["transaction_id"]
+            }
+        }
+    }
+]
 
 def call_mcp_tool(tool_name: str, arguments: dict) -> Optional[str]:
     """Memanggil tool pada MCP Server (port 8001)"""
@@ -80,106 +148,76 @@ def call_mcp_tool(tool_name: str, arguments: dict) -> Optional[str]:
             "arguments": arguments,
             "api_key": api_key
         }
-        res = requests.post(MCP_SERVER_URL, json=payload, timeout=5)
+        res = requests.post(MCP_SERVER_URL, json=payload, timeout=10)
         if res.status_code == 200:
             data = res.json()
             if data.get("success"):
                 return str(data.get("result"))
+            else:
+                return f"Error dari MCP Server: {data.get('error')}"
     except Exception as e:
         print(f"Error calling MCP Tool {tool_name}: {e}")
+        return f"Gagal terhubung ke MCP Server: {e}"
     return None
 
-def parse_amount(text: str) -> float:
-    """Ekstrak nominal dari teks, handle 'k' sebagai ribuan dan hapus titik/koma ribuan"""
-    text = text.lower().replace('.', '').replace(',', '')
-    match = re.search(r'(\d+)\s*k', text)
-    if match:
-        return float(match.group(1)) * 1000
-    amounts = re.findall(r'\d+', text)
-    return float(amounts[0]) if amounts else 0.0
+def sanitize_tool_args(tool_name: str, args: dict, user_id: int, user_msg: str) -> dict:
+    """Sanitasi dan melengkapi argumen tool sebelum dikirim ke MCP Server"""
+    args["user_id"] = user_id
+    today_str = datetime.now().strftime("%Y-%m-%d")
 
-def parse_date_for_delete(text: str) -> Optional[str]:
-    """Ekstrak tanggal sederhana dari teks untuk keperluan delete/update"""
-    from datetime import datetime, timedelta
-    text = text.lower()
-    today = datetime.now()
-    if "hari ini" in text:
-        return today.strftime("%Y-%m-%d")
-    if "kemarin" in text:
-        return (today - timedelta(days=1)).strftime("%Y-%m-%d")
-    match = re.search(r'\d{4}-\d{2}-\d{2}', text)
-    if match:
-        return match.group(0)
-    return None
+    if tool_name == "create_transaction":
+        if "title" not in args or not args["title"]:
+            # Bersihkan kata perintah untuk mengambil judul transaksi
+            clean_t = re.sub(r'\b(catat|tambah|pemasukan|pengeluaran|bayar|beli|sebesar|rp|ribu|k|hari ini|kemarin)\b', '', user_msg, flags=re.IGNORECASE)
+            clean_t = re.sub(r'\d+(?:[\.,]\d+)?', '', clean_t).strip()
+            args["title"] = clean_t.capitalize() if clean_t else "Transaksi Baru"
 
-def extract_delete_params(message: str):
-    """Ekstrak judul dan tanggal dari pesan penghapusan"""
-    msg_lower = message.lower()
-    clean_text = re.sub(r'(hapus|delete|hilangkan|buang|remove|transaksi|catatan)', '', msg_lower, flags=re.IGNORECASE).strip()
-    date_val = parse_date_for_delete(msg_lower)
-    if date_val:
-        clean_text = clean_text.replace("hari ini", "").replace("kemarin", "").strip()
-        clean_text = re.sub(r'\d{4}-\d{2}-\d{2}', '', clean_text).strip()
-    return clean_text, date_val
+        if "amount" in args and args["amount"] is not None:
+            try:
+                args["amount"] = float(args["amount"])
+            except (ValueError, TypeError):
+                args["amount"] = 0.0
+        else:
+            args["amount"] = 0.0
 
-def find_matching_transaction(res_tx: str, target_title: str, target_date: Optional[str] = None, target_id: Optional[str] = None):
-    """Mencari ID transaksi yang cocok dari output string format MCP get_transactions"""
-    lines = res_tx.split('\n')
-    for line in lines:
-        line = line.strip()
-        if not line or '[' not in line or ']' not in line:
-            continue
-        try:
-            id_match = re.search(r'\[(\d+)\]', line)
-            if not id_match:
-                continue
-            tx_id = id_match.group(1)
-            content = line.split(']', 1)[1].strip()
-            parts = [p.strip() for p in content.split('|')]
-            tx_date = parts[0] if len(parts) > 0 else ""
-            tx_title = parts[1].lower() if len(parts) > 1 else ""
+        if "date" not in args or not args["date"]:
+            args["date"] = today_str
 
-            # 1. If target_id is provided, match ONLY by ID
-            if target_id:
-                if tx_id == str(target_id):
-                    return tx_id, parts[1] if len(parts) > 1 else ""
-                continue
+        if "transaction_type" not in args or args["transaction_type"] not in ["income", "expense"]:
+            msg_lower = user_msg.lower()
+            args["transaction_type"] = "income" if any(k in msg_lower for k in ["gaji", "terima", "masuk", "bonus", "pemasukan"]) else "expense"
 
-            # 2. Match by Title and Date
-            title_match = (not target_title) or (target_title.lower() in tx_title) or (tx_title in target_title.lower())
-            date_match = (not target_date) or (target_date in tx_date)
+        valid_cats = ["Makanan & Minuman", "Transportasi", "Belanja", "Pendapatan", "Kesehatan", "Hiburan", "Tagihan", "Lainnya"]
+        if "category" not in args or not args["category"] or args["category"] not in valid_cats:
+            msg_lower = user_msg.lower()
+            if any(k in msg_lower for k in ["makan", "minum", "resto", "cafe", "nasi", "kopi", "warung"]):
+                args["category"] = "Makanan & Minuman"
+            elif any(k in msg_lower for k in ["bensin", "transport", "gojek", "grab", "parkir", "tol"]):
+                args["category"] = "Transportasi"
+            elif any(k in msg_lower for k in ["belanja", "baju", "sepatu", "tokopedia", "shopee"]):
+                args["category"] = "Belanja"
+            elif any(k in msg_lower for k in ["gaji", "bonus", "transfer masuk"]):
+                args["category"] = "Pendapatan"
+            else:
+                args["category"] = "Lainnya"
 
-            if title_match and date_match:
-                return tx_id, parts[1] if len(parts) > 1 else ""
-        except Exception:
-            continue
-    return None, None
+    elif tool_name == "get_transactions":
+        if "limit" not in args or not args["limit"]:
+            args["limit"] = 10
+        else:
+            try:
+                args["limit"] = int(args["limit"])
+            except (ValueError, TypeError):
+                args["limit"] = 10
 
-def extract_transaction_details(message: str):
-    """Ekstrak judul, nominal, dan kategori dari pesan user dengan logika hybrid (Keyword + AI)"""
-    msg_lower = message.lower()
-    tx_type = "income" if any(k in msg_lower for k in ["pemasukan", "gaji", "terima", "masuk", "transfer masuk", "bonus"]) else "expense"
-    amount = parse_amount(message)
-    category = "Lainnya"
-    cat_map = {
-        "Makanan & Minuman": ["makan", "minum", "resto", "cafe", "warung", "ayam", "nasi", "kopi", "bakso", "mie", "snack", "cemilan", "starbucks", "mcdo", "kfc", "go-food", "grab-food"],
-        "Transportasi": ["bensin", "transport", "gojek", "grab", "ojek", "taxi", "tiket", "parkir", "tol", "kereta", "bus", "pesawat", "go-ride", "go-car"],
-        "Belanja": ["belanja", "shopee", "tokopedia", "mall", "pasar", "beli", "skin-care", "baju", "sepatu", "elektronik", "lazada"],
-        "Pendapatan": ["gaji", "bonus", "komisi", "hadiah", "transfer masuk", "investasi"],
-        "Kesehatan": ["obat", "dokter", "rumah sakit", "klinik", "apotek", "vitamin", "checkup"],
-        "Hiburan": ["bioskop", "netflix", "spotify", "game", "konser", "wisata", "jalan-jalan"],
-        "Tagihan": ["listrik", "air", "wifi", "internet", "bpjs", "kos", "kontrakan", "cicilan"]
-    }
-    for cat, keywords in cat_map.items():
-        if any(k in msg_lower for k in keywords):
-            category = cat
-            break
-    clean_title = re.sub(r'(catat|tambah|beli|pemasukan|pengeluaran|makanan|minuman|dengan harga|harga|nominal|rupiah|rp|hari ini|tadi|besok|kemarin)', '', msg_lower, flags=re.IGNORECASE)
-    clean_title = re.sub(r'\d+\s*k?', '', clean_title)
-    clean_title = clean_title.strip(',. ').strip()
-    if not clean_title:
-        clean_title = "Transaksi Baru"
-    return tx_type, amount, category, clean_title.capitalize()
+    elif tool_name in ["update_transaction", "delete_transaction"]:
+        if "transaction_id" in args and args["transaction_id"] is not None:
+            try:
+                args["transaction_id"] = int(args["transaction_id"])
+            except (ValueError, TypeError):
+                pass
+
+    return args
 
 @router.post("/", response_model=ChatResponse)
 async def chat_with_ai(
@@ -187,115 +225,116 @@ async def chat_with_ai(
     current_user: User = Depends(get_current_user)
 ):
     user_msg = request.message.strip()
-    msg_lower = user_msg.lower()
     user_id = current_user.id
+    active_model = get_active_model()
+    today_str = datetime.now().strftime("%Y-%m-%d")
 
-    # 1. DELETE: Hapus Transaksi (Diutamakan sebelum READ)
-    if any(k in msg_lower for k in ["hapus", "delete", "hilangkan", "buang", "remove"]):
-        target_title, target_date = extract_delete_params(user_msg)
-        id_match_prompt = re.search(r'\b(?:id|#)\s*(\d+)\b', msg_lower)
-        target_id = id_match_prompt.group(1) if id_match_prompt else (target_title if target_title.isdigit() else None)
-
-        res_tx = call_mcp_tool("get_transactions", {"user_id": user_id, "limit": 50})
-        if res_tx:
-            matching_tx_id, tx_title_found = find_matching_transaction(
-                res_tx,
-                target_title="" if target_id else target_title,
-                target_date=target_date,
-                target_id=target_id
-            )
-            if matching_tx_id:
-                del_res = call_mcp_tool("delete_transaction", {"transaction_id": int(matching_tx_id), "user_id": user_id})
-                return ChatResponse(response=f"🤖 **FinTracks AI Assistant:**\n\n{del_res if del_res else f'Transaksi `{tx_title_found or matching_tx_id}` berhasil dihapus.'}")
-            else:
-                detail_str = f"ID [{target_id}]" if target_id else f"'{target_title or 'terbaru'}'"
-                date_str = f" pada tanggal {target_date}" if target_date else ""
-                return ChatResponse(response=f"🤖 **FinTracks AI Assistant:**\n\nMaaf, saya tidak menemukan transaksi dengan detail {detail_str}{date_str}.")
-        else:
-            return ChatResponse(response=f"🤖 **FinTracks AI Assistant:**\n\nTidak ada transaksi yang bisa dihapus.")
-
-    # 2. UPDATE: Ubah Transaksi
-    if any(k in msg_lower for k in ["ubah", "update", "ganti", "edit", "perbarui"]):
-        target_title, target_date = extract_delete_params(user_msg)
-        id_match_prompt = re.search(r'\b(?:id|#)\s*(\d+)\b', msg_lower)
-        target_id = id_match_prompt.group(1) if id_match_prompt else (target_title if target_title.isdigit() else None)
-        amount = parse_amount(user_msg)
-
-        res_tx = call_mcp_tool("get_transactions", {"user_id": user_id, "limit": 50})
-        if res_tx:
-            matching_tx_id, tx_title_found = find_matching_transaction(
-                res_tx,
-                target_title="" if target_id else target_title,
-                target_date=target_date,
-                target_id=target_id
-            )
-            if matching_tx_id and amount > 0:
-                upd_res = call_mcp_tool("update_transaction", {
-                    "transaction_id": int(matching_tx_id),
-                    "user_id": user_id,
-                    "amount": amount
-                })
-                return ChatResponse(response=f"🤖 **FinTracks AI Assistant:**\n\n{upd_res if upd_res else 'Nominal transaksi berhasil diperbarui.'}")
-            elif not matching_tx_id:
-                return ChatResponse(response=f"🤖 **FinTracks AI Assistant:**\n\nMaaf, saya tidak menemukan transaksi yang ingin diubah.")
-            elif amount <= 0:
-                return ChatResponse(response=f"🤖 **FinTracks AI Assistant:**\n\nMohon sebutkan nominal baru untuk transaksi tersebut (contoh: 'ubah nominal ikan bakar jadi 50k').")
-
-    # 3. CREATE: Tambah Transaksi
-    if any(k in msg_lower for k in ["catat", "tambah", "pemasukan", "pengeluaran", "bayar", "beli"]):
-        tx_type, amount, category, title = extract_transaction_details(user_msg)
-        if category == "Lainnya" and amount > 0:
-            try:
-                ai_cat_prompt = f"Kategorikan transaksi berikut: '{title}'. Pilih satu dari: [Makanan & Minuman, Transportasi, Belanja, Pendapatan, Kesehatan, Hiburan, Tagihan, Lainnya]. Jawab HANYA dengan nama kategorinya saja."
-                result_cat = call_ollama_chat(
-                    messages=[{"role": "user", "content": ai_cat_prompt}],
-                    timeout=10
-                )
-                if result_cat:
-                    ai_cat = result_cat.get("message", {}).get("content", "").strip()
-                    valid_cats = ["Makanan & Minuman", "Transportasi", "Belanja", "Pendapatan", "Kesehatan", "Hiburan", "Tagihan", "Lainnya"]
-                    if any(vc in ai_cat for vc in valid_cats):
-                        category = next((vc for vc in valid_cats if vc in ai_cat), "Lainnya")
-            except Exception as e:
-                print(f"Category AI Error: {e}")
-        if amount > 0:
-            from datetime import datetime
-            date_str = datetime.now().strftime("%Y-%m-%d")
-            mcp_res = call_mcp_tool("create_transaction", {
-                "user_id": user_id,
-                "title": title,
-                "amount": amount,
-                "category": category,
-                "transaction_type": tx_type,
-                "date": date_str,
-                "note": "Dicatat via FinTracks AI Chatbot"
-            })
-            if mcp_res:
-                return ChatResponse(response=f"🤖 **FinTracks AI Assistant:**\n\n{mcp_res}")
-
-    # 4. READ: Ringkasan / Saldo
-    if any(k in msg_lower for k in ["saldo", "ringkasan", "summary", "total"]):
-        mcp_res = call_mcp_tool("get_summary", {"user_id": user_id})
-        if mcp_res:
-            return ChatResponse(response=f"🤖 **FinTracks AI Assistant:**\n\n{mcp_res}")
-
-    # 5. READ: Riwayat Transaksi
-    if any(k in msg_lower for k in ["lihat", "riwayat", "daftar", "list", "tampilkan", "cek transaksi"]) or msg_lower in ["transaksi", "transaksi saya"]:
-        mcp_res = call_mcp_tool("get_transactions", {"user_id": user_id, "limit": 10})
-        if mcp_res:
-            return ChatResponse(response=f"🤖 **FinTracks AI Assistant:**\n\nBerikut transaksi terbaru Anda:\n{mcp_res}")
-
-    # 6. Ollama Fallback (menggunakan model aktif dari ACTIVE_MODEL di .env)
-    system_prompt = f"Anda adalah asisten keuangan pribadi FinTracks untuk User ID {user_id}. Jawablah dengan ramah dalam Bahasa Indonesia."
-    result = call_ollama_chat(
-        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_msg}]
+    system_prompt = (
+        f"Anda adalah FinTracks AI Assistant, asisten keuangan pribadi yang cerdas.\n"
+        f"User ID: {user_id}. Tanggal hari ini: {today_str}.\n"
+        f"Anda memiliki akses ke MCP Tools untuk mengelola data keuangan pengguna:\n"
+        f"- create_transaction: Mencatat transaksi baru (pemasukan/pengeluaran).\n"
+        f"- get_transactions: Melihat riwayat transaksi.\n"
+        f"- get_summary: Melihat ringkasan pemasukan, pengeluaran, dan saldo.\n"
+        f"- update_transaction: Mengubah transaksi yang sudah ada.\n"
+        f"- delete_transaction: Menghapus transaksi.\n\n"
+        f"Aturan Utama:\n"
+        f"1. Jika pengguna meminta aksi keuangan (catat, lihat, ubah, hapus, cek saldo/summary), "
+        f"Anda WAJIB memanggil MCP Tool yang sesuai.\n"
+        f"2. Jawablah dengan bahasa Indonesia yang ramah, sopan, dan jelas."
     )
-    if result:
-        ai_msg = result.get("message", {}).get("content")
-        if ai_msg:
-            return ChatResponse(response=ai_msg)
 
-    # 7. Final Fallback
-    mcp_res = call_mcp_tool("get_summary", {"user_id": user_id})
-    return ChatResponse(response=f"Halo! Saya AI Assistant. Coba katakan 'Cek saldo', 'Hapus transaksi ikan bakar', atau 'Catat makan siang 20k'.\n\n{mcp_res if mcp_res else ''}")
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg}
+    ]
+
+    try:
+        # Step 1: Kirim request ke Ollama bersama definisi MCP Tools
+        payload = {
+            "model": active_model,
+            "messages": messages,
+            "tools": TOOLS_SCHEMA,
+            "stream": False,
+            "options": {"temperature": 0.2}
+        }
+        res = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
+        
+        # Jika model tidak mendukung native function calling (HTTP 400 "does not support tools")
+        if res.status_code == 400 and "does not support tools" in res.text:
+            print(f"[Ollama Warning] Model '{active_model}' tidak mendukung native function calling. Memanggil dalam mode standar.")
+            fallback_payload = {
+                "model": active_model,
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0.5}
+            }
+            res = requests.post(OLLAMA_URL, json=fallback_payload, timeout=OLLAMA_TIMEOUT)
+
+        if res.status_code != 200:
+            print(f"[Ollama Error] HTTP {res.status_code}: {res.text}")
+            return ChatResponse(response=f"🤖 **FinTracks AI:** Model '{active_model}' mengembalikan error (HTTP {res.status_code}). Coba gunakan 'ollama/llama3.2'.")
+
+        res_data = res.json()
+        ai_message = res_data.get("message", {})
+        tool_calls = ai_message.get("tool_calls", [])
+
+        # Step 2: Jika AI memutuskan untuk memanggil MCP Tool
+        if tool_calls:
+            print(f"[Agentic MCP] Model '{active_model}' memutuskan memanggil {len(tool_calls)} tool(s).")
+            tool_outputs = []
+
+            for tool_call in tool_calls:
+                fn_name = tool_call.get("function", {}).get("name")
+                fn_args = tool_call.get("function", {}).get("arguments", {})
+
+                print(f"[Agentic MCP Executing] Tool: {fn_name} | Raw Args: {fn_args}")
+
+                # Sanitasi dan inject user_id ke argumen tool
+                sanitized_args = sanitize_tool_args(fn_name, fn_args, user_id, user_msg)
+
+                # Panggil MCP Server
+                mcp_result = call_mcp_tool(fn_name, sanitized_args)
+                print(f"[MCP Result] {mcp_result}")
+
+                tool_outputs.append(str(mcp_result or "Operasi MCP selesai."))
+
+            # Step 3: Sintesis respon akhir yang ramah & manusiawi berdasarkan hasil MCP Tool
+            synthesis_messages = [
+                {
+                    "role": "system", 
+                    "content": "Anda adalah FinTracks AI Assistant. Tugas Anda adalah menyampaikan hasil eksekusi MCP Tool kepada pengguna secara ramah, sopan, rapi, dan jelas dalam Bahasa Indonesia."
+                },
+                {
+                    "role": "user", 
+                    "content": f"Pesan Pengguna: '{user_msg}'\nHasil Eksekusi MCP Tool: {tool_outputs[0]}"
+                }
+            ]
+
+            synth_res = requests.post(
+                OLLAMA_URL, 
+                json={"model": active_model, "messages": synthesis_messages, "stream": False, "options": {"temperature": 0.5}}, 
+                timeout=OLLAMA_TIMEOUT
+            )
+            
+            if synth_res.status_code == 200:
+                final_ai_msg = synth_res.json().get("message", {}).get("content", "")
+                if final_ai_msg:
+                    return ChatResponse(response=final_ai_msg)
+
+            # Fallback jika final LLM response kosong
+            return ChatResponse(response=f"🤖 **FinTracks AI Assistant:**\n\n" + "\n\n".join(tool_outputs))
+
+        # Step 4: Jika AI tidak memerlukan tool (percakapan umum/tanya jawab)
+        direct_response = ai_message.get("content", "")
+        if direct_response:
+            return ChatResponse(response=direct_response)
+
+        return ChatResponse(response="🤖 **FinTracks AI Assistant:** Maaf, saya tidak dapat memahami permintaan Anda.")
+
+    except requests.exceptions.Timeout:
+        return ChatResponse(response=f"🤖 **FinTracks AI:** Respon model AI ({active_model}) mengalami timeout. Coba gunakan model yang lebih ringan.")
+    except Exception as e:
+        print(f"[Agentic Error] {e}")
+        return ChatResponse(response=f"🤖 **FinTracks AI:** Terjadi kesalahan saat memproses pesan: {str(e)}")
 
