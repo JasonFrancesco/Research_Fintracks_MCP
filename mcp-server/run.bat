@@ -1,0 +1,3 @@
+@echo off
+echo Menjalankan MCP Server...
+..\backend\venv\Scripts\python.exe server.py

@@ -1,0 +1,5 @@
+# MCP Server Dependencies
+mcp<2
+sqlalchemy
+psycopg2-binary
+python-dotenv
