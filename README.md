@@ -13,3 +13,6 @@ Personal finance application with AI Chatbot integration via Model Context Proto
 - /mcp-server: Tools and Logic for AI Chatbot
 - /frontend: User Interface
 - /database: Database migrations
+
+
+ok
