@@ -16,8 +16,60 @@ class ChatResponse(BaseModel):
     response: str
 
 MCP_SERVER_URL = "http://127.0.0.1:8001/call"
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = "llama3.2"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_URL = f"{OLLAMA_BASE_URL}/api/chat"
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "30"))
+
+
+def get_active_model() -> str:
+    """
+    Membaca model AI aktif dari environment variable ACTIVE_MODEL setiap kali
+    dipanggil (bukan konstanta tetap saat startup), sehingga model bisa diganti
+    (misal dari 'ollama/llama3.2' ke 'ollama/gemma:31b' atau model lain apapun
+    yang sudah di-pull di Ollama) hanya dengan mengubah nilai ACTIVE_MODEL di
+    file .env lalu me-restart server backend, tanpa perlu mengubah kode ini.
+
+    Format yang didukung di .env:
+      ACTIVE_MODEL=ollama/llama3.2   -> dipakai sebagai "llama3.2"
+      ACTIVE_MODEL=llama3.2          -> dipakai sebagai "llama3.2" (tanpa prefix juga valid)
+    """
+    raw = os.getenv("ACTIVE_MODEL", "ollama/llama3.2").strip()
+    if not raw:
+        raw = "ollama/llama3.2"
+    return raw.split("/", 1)[1] if "/" in raw else raw
+
+
+def call_ollama_chat(messages: list, timeout: Optional[float] = None) -> Optional[dict]:
+    """
+    Wrapper terpusat untuk memanggil Ollama chat API menggunakan model aktif
+    yang sedang dikonfigurasi di .env. Mengembalikan None (tanpa melempar
+    exception) bila terjadi kegagalan koneksi, timeout, atau model belum
+    tersedia di Ollama, sehingga pemanggil selalu bisa fallback dengan aman.
+    """
+    model_name = get_active_model()
+    try:
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": 0.7}
+        }
+        res = requests.post(OLLAMA_URL, json=payload, timeout=timeout or OLLAMA_TIMEOUT)
+        if res.status_code == 200:
+            return res.json()
+        if res.status_code == 404:
+            print(f"[Ollama] Model '{model_name}' tidak ditemukan. "
+                  f"Jalankan 'ollama pull {model_name}' terlebih dahulu.")
+        else:
+            print(f"[Ollama] Gagal memanggil model '{model_name}': HTTP {res.status_code} - {res.text[:200]}")
+    except requests.exceptions.Timeout:
+        print(f"[Ollama] Timeout memanggil model '{model_name}' (>{timeout or OLLAMA_TIMEOUT}s). "
+              f"Model besar mungkin butuh OLLAMA_TIMEOUT lebih besar di .env.")
+    except requests.exceptions.ConnectionError:
+        print(f"[Ollama] Tidak dapat terhubung ke {OLLAMA_URL}. Pastikan Ollama sedang berjalan.")
+    except Exception as e:
+        print(f"[Ollama] Error tak terduga memanggil model '{model_name}': {e}")
+    return None
 
 def call_mcp_tool(tool_name: str, arguments: dict) -> Optional[str]:
     """Memanggil tool pada MCP Server (port 8001)"""
@@ -195,14 +247,12 @@ async def chat_with_ai(
         if category == "Lainnya" and amount > 0:
             try:
                 ai_cat_prompt = f"Kategorikan transaksi berikut: '{title}'. Pilih satu dari: [Makanan & Minuman, Transportasi, Belanja, Pendapatan, Kesehatan, Hiburan, Tagihan, Lainnya]. Jawab HANYA dengan nama kategorinya saja."
-                payload = {
-                    "model": MODEL_NAME,
-                    "messages": [{"role": "user", "content": ai_cat_prompt}],
-                    "stream": False
-                }
-                res_cat = requests.post(OLLAMA_URL, json=payload, timeout=5)
-                if res_cat.status_code == 200:
-                    ai_cat = res_cat.json().get("message", {}).get("content", "").strip()
+                result_cat = call_ollama_chat(
+                    messages=[{"role": "user", "content": ai_cat_prompt}],
+                    timeout=10
+                )
+                if result_cat:
+                    ai_cat = result_cat.get("message", {}).get("content", "").strip()
                     valid_cats = ["Makanan & Minuman", "Transportasi", "Belanja", "Pendapatan", "Kesehatan", "Hiburan", "Tagihan", "Lainnya"]
                     if any(vc in ai_cat for vc in valid_cats):
                         category = next((vc for vc in valid_cats if vc in ai_cat), "Lainnya")
@@ -235,23 +285,15 @@ async def chat_with_ai(
         if mcp_res:
             return ChatResponse(response=f"🤖 **FinTracks AI Assistant:**\n\nBerikut transaksi terbaru Anda:\n{mcp_res}")
 
-    # 6. Ollama Fallback
-    try:
-        system_prompt = f"Anda adalah asisten keuangan pribadi FinTracks untuk User ID {user_id}. Jawablah dengan ramah dalam Bahasa Indonesia."
-        payload = {
-            "model": MODEL_NAME,
-            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_msg}],
-            "stream": False,
-            "options": {"temperature": 0.7}
-        }
-        res = requests.post(OLLAMA_URL, json=payload, timeout=10)
-        if res.status_code == 200:
-            result = res.json()
-            ai_msg = result.get("message", {}).get("content")
-            if ai_msg:
-                return ChatResponse(response=ai_msg)
-    except Exception:
-        pass
+    # 6. Ollama Fallback (menggunakan model aktif dari ACTIVE_MODEL di .env)
+    system_prompt = f"Anda adalah asisten keuangan pribadi FinTracks untuk User ID {user_id}. Jawablah dengan ramah dalam Bahasa Indonesia."
+    result = call_ollama_chat(
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_msg}]
+    )
+    if result:
+        ai_msg = result.get("message", {}).get("content")
+        if ai_msg:
+            return ChatResponse(response=ai_msg)
 
     # 7. Final Fallback
     mcp_res = call_mcp_tool("get_summary", {"user_id": user_id})
