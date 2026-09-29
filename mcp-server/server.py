@@ -70,7 +70,7 @@ def update_transaction(
 
 @mcp.tool()
 def delete_transaction(transaction_id: int, user_id: int) -> str:
-    """Hapus catatan transaksi keuangan berdasarkan ID."""
+    """Hapus catatan transaksi keuangan berdasarkan Judul atau Tanggal atau kombinasi Judul dan Tanggal."""
     return delete_transaction_tool(transaction_id, user_id)
 
 @mcp.tool()

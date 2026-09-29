@@ -15,4 +15,4 @@ Personal finance application with AI Chatbot integration via Model Context Proto
 - /database: Database migrations
 
 
-ok
+
