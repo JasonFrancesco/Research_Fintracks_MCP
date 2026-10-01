@@ -1,6 +1,6 @@
 import React, { useState, useContext } from 'react';
 import { AuthContext } from '../context/AuthContext';
-import { useNavigate, Link } from 'react-router-dom';
+import { useNavigate, useSearchParams, Link } from 'react-router-dom';
 
 const Login = () => {
     const [email, setEmail] = useState('');
@@ -9,6 +9,9 @@ const Login = () => {
 
     const { login } = useContext(AuthContext);
     const navigate = useNavigate();
+    // Ditandai oleh interceptor di services/api.js saat sebuah request dijawab 401.
+    const [searchParams] = useSearchParams();
+    const sessionExpired = searchParams.get('expired') === '1';
 
     const handleSubmit = async (e) => {
         e.preventDefault();
@@ -33,8 +36,14 @@ const Login = () => {
                     Masuk ke dashboard keuangan Anda
                 </p>
 
+                {sessionExpired && !errorMsg && (
+                    <div className="mb-4 p-3 bg-amber-50 border border-amber-200 text-amber-800 text-sm rounded-lg" role="status">
+                        Sesi Anda sudah berakhir. Silakan login kembali untuk melanjutkan.
+                    </div>
+                )}
+
                 {errorMsg && (
-                    <div className="mb-4 p-3 bg-red-100 text-red-700 text-sm rounded-lg">
+                    <div className="mb-4 p-3 bg-red-100 text-red-700 text-sm rounded-lg" role="alert">
                         {errorMsg}
                     </div>
                 )}

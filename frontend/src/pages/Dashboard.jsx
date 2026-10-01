@@ -4,6 +4,7 @@ import api from '../services/api';
 import StatCard from '../components/StatCard';
 import TransactionChart from '../components/TransactionChart';
 import TransactionTable from '../components/TransactionTable';
+import { categoriesFor, isCategoryAllowed, defaultCategoryFor } from '../constants/categories';
 
 const Dashboard = () => {
     const { logout } = useContext(AuthContext);
@@ -64,8 +65,13 @@ const Dashboard = () => {
     };
 
     const handleEditClick = (transaction) => {
+        // Data lama atau hasil chatbot bisa memuat kombinasi tipe dan kategori yang
+        // tidak sah, misalnya income berkategori 'Belanja'. Kategori dikosongkan agar
+        // user memilih ulang secara sadar, bukan diganti diam-diam oleh aplikasi.
+        const categoryIsValid = isCategoryAllowed(transaction.transaction_type, transaction.category);
         setEditData({
             ...transaction,
+            category: categoryIsValid ? transaction.category : '',
             transaction_date: transaction.transaction_date ? transaction.transaction_date.split('T')[0] : new Date().toISOString().split('T')[0]
         });
         setIsEditModalOpen(true);
@@ -73,7 +79,15 @@ const Dashboard = () => {
 
     const handleInputChange = (e) => {
         const { name, value } = e.target;
-        setFormData(prev => ({ ...prev, [name]: value }));
+        setFormData(prev => {
+            const next = { ...prev, [name]: value };
+            // Ganti tipe transaksi bisa membuat kategori yang sedang terpilih
+            // tidak lagi sah, misalnya 'Pendapatan' pada pengeluaran.
+            if (name === 'transaction_type' && !isCategoryAllowed(value, prev.category)) {
+                next.category = defaultCategoryFor(value);
+            }
+            return next;
+        });
     };
 
     const handleSubmit = async (e) => {
@@ -117,7 +131,13 @@ const Dashboard = () => {
 
     const handleEditInputChange = (e) => {
         const { name, value } = e.target;
-        setEditData(prev => ({ ...prev, [name]: value }));
+        setEditData(prev => {
+            const next = { ...prev, [name]: value };
+            if (name === 'transaction_type' && !isCategoryAllowed(value, prev.category)) {
+                next.category = defaultCategoryFor(value);
+            }
+            return next;
+        });
     };
 
     if (loading) return <div className="flex h-screen items-center justify-center">Loading...</div>;
@@ -221,12 +241,14 @@ const Dashboard = () => {
                                         value={formData.category}
                                         onChange={handleInputChange}
                                         className="w-full p-2 border rounded-lg outline-none focus:ring-2 focus:ring-blue-500"
+                                        required
                                     >
-                                        <option value="Makanan & Minuman">Makanan & Minuman</option>
-                                        <option value="Transportasi">Transportasi</option>
-                                        <option value="Belanja">Belanja</option>
-                                        <option value="Pendapatan">Pendapatan</option>
-                                        <option value="Lainnya">Lainnya</option>
+                                        {!isCategoryAllowed(formData.transaction_type, formData.category) && (
+                                            <option value="">— Pilih kategori —</option>
+                                        )}
+                                        {categoriesFor(formData.transaction_type).map(c => (
+                                            <option key={c} value={c}>{c}</option>
+                                        ))}
                                     </select>
                                 </div>
                                 <div>
@@ -321,13 +343,15 @@ const Dashboard = () => {
                                         name="category"
                                         value={editData.category}
                                         onChange={handleEditInputChange}
-                                        className="w-full p-2 border rounded-lg outline-//none focus:ring-2 focus:ring-blue-500"
+                                        className="w-full p-2 border rounded-lg outline-none focus:ring-2 focus:ring-blue-500"
+                                        required
                                     >
-                                        <option value="Makanan & Minuman">Makanan & Minuman</option>
-                                        <option value="Transportasi">Transportasi</option>
-                                        <option value="Belanja">Belanja</option>
-                                        <option value="Pendapatan">Pendapatan</option>
-                                        <option value="Lainnya">Lainnya</option>
+                                        {!isCategoryAllowed(editData.transaction_type, editData.category) && (
+                                            <option value="">— Pilih kategori —</option>
+                                        )}
+                                        {categoriesFor(editData.transaction_type).map(c => (
+                                            <option key={c} value={c}>{c}</option>
+                                        ))}
                                     </select>
                                 </div>
                                 <div>

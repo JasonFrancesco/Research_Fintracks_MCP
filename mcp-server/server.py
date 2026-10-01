@@ -49,8 +49,10 @@ def get_transactions(user_id: int, limit: int = 10) -> str:
 
 @mcp.tool()
 def update_transaction(
-    transaction_id: int,
     user_id: int,
+    transaction_id: Optional[int] = None,
+    match_title: Optional[str] = None,
+    match_date: Optional[str] = None,
     title: Optional[str] = None,
     amount: Optional[float] = None,
     category: Optional[str] = None,
@@ -58,7 +60,20 @@ def update_transaction(
     date: Optional[str] = None,
     note: Optional[str] = None
 ) -> str:
-    """Ubah data transaksi keuangan yang sudah ada berdasarkan ID."""
+    """
+    Ubah data transaksi keuangan yang sudah ada.
+
+    Target transaksi ditentukan lewat salah satu cara berikut, wajib ada minimal satu:
+    - transaction_id: ID numerik transaksi, cara paling pasti.
+    - match_title: kata kunci judul transaksi yang dicari, dipakai bila ID tidak diketahui.
+    - match_date: tanggal transaksi yang dicari, format YYYY-MM-DD.
+    match_title dan match_date boleh dikombinasikan untuk mempersempit pencarian.
+    Jika kriteria pencarian cocok dengan lebih dari satu transaksi, tidak ada data
+    yang diubah dan tool mengembalikan daftar kandidat beserta ID-nya.
+
+    Parameter title, amount, category, transaction_type, date, dan note adalah
+    NILAI BARU. Jangan tertukar: 'title' mengubah judul, 'match_title' mencari judul.
+    """
     updates = {}
     if title is not None: updates["title"] = title
     if amount is not None: updates["amount"] = amount
@@ -66,11 +81,17 @@ def update_transaction(
     if transaction_type is not None: updates["transaction_type"] = transaction_type
     if date is not None: updates["date"] = date
     if note is not None: updates["note"] = note
-    return update_transaction_tool(transaction_id, user_id, **updates)
+    return update_transaction_tool(
+        user_id=user_id,
+        transaction_id=transaction_id,
+        match_title=match_title,
+        match_date=match_date,
+        **updates,
+    )
 
 @mcp.tool()
 def delete_transaction(transaction_id: int, user_id: int) -> str:
-    """Hapus catatan transaksi keuangan berdasarkan Judul atau Tanggal atau kombinasi Judul dan Tanggal."""
+    """Hapus catatan transaksi keuangan berdasarkan ID transaksi."""
     return delete_transaction_tool(transaction_id, user_id)
 
 @mcp.tool()

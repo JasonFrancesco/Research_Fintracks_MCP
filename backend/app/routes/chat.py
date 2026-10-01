@@ -700,22 +700,36 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "update_transaction",
-            "description": "Mengubah data transaksi yang sudah ada berdasarkan ID transaksi.",
+            "description": (
+                "Mengubah data transaksi yang sudah ada. Transaksi target ditentukan lewat "
+                "transaction_id, atau lewat match_title dan/atau match_date bila ID tidak diketahui. "
+                "WAJIB mengisi minimal satu dari ketiganya. Jika kriteria pencarian cocok dengan "
+                "lebih dari satu transaksi, tidak ada yang diubah dan tool mengembalikan daftar "
+                "kandidat beserta ID-nya untuk dikonfirmasi ke pengguna."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "transaction_id": {
                         "type": "integer",
-                        "description": "ID transaksi numerik yang ingin diubah."
+                        "description": "PENCARIAN. ID transaksi numerik. Gunakan ini jika pengguna menyebut ID, atau jika ID sudah terlihat pada daftar transaksi di percakapan sebelumnya."
                     },
-                    "title": {"type": "string", "description": "Judul baru (opsional)"},
-                    "amount": {"type": "number", "description": "Nominal baru (opsional)"},
-                    "category": {"type": "string", "description": "Kategori baru (opsional)"},
-                    "transaction_type": {"type": "string", "enum": ["income", "expense"], "description": "Jenis transaksi baru (opsional)"},
-                    "date": {"type": "string", "description": "Tanggal baru format YYYY-MM-DD (opsional)"},
-                    "note": {"type": "string", "description": "Catatan baru (opsional)"}
+                    "match_title": {
+                        "type": "string",
+                        "description": "PENCARIAN, bukan nilai baru. Kata kunci judul transaksi yang ingin dicari ketika pengguna tidak menyebut ID. Contoh: pengguna berkata 'ubah transaksi kopi jadi 30rb' maka match_title='kopi'. Ambil hanya kata kunci bendanya, tanpa kata perintah dan tanpa nominal."
+                    },
+                    "match_date": {
+                        "type": "string",
+                        "description": "PENCARIAN, bukan nilai baru. Tanggal transaksi yang ingin dicari, format YYYY-MM-DD. Contoh: pengguna berkata 'ubah pengeluaran tanggal 5 Oktober' maka match_date='2026-10-05'. Boleh dikombinasikan dengan match_title."
+                    },
+                    "title": {"type": "string", "description": "NILAI BARU untuk judul (opsional). Isi hanya jika pengguna ingin mengganti judulnya."},
+                    "amount": {"type": "number", "description": "NILAI BARU untuk nominal dalam angka Rupiah tanpa simbol (opsional)."},
+                    "category": {"type": "string", "description": "NILAI BARU untuk kategori (opsional)."},
+                    "transaction_type": {"type": "string", "enum": ["income", "expense"], "description": "NILAI BARU untuk jenis transaksi (opsional)."},
+                    "date": {"type": "string", "description": "NILAI BARU untuk tanggal transaksi, format YYYY-MM-DD (opsional). Jangan pakai ini untuk mencari transaksi, gunakan match_date."},
+                    "note": {"type": "string", "description": "NILAI BARU untuk catatan (opsional)."}
                 },
-                "required": ["transaction_id"]
+                "required": []
             }
         }
     },
@@ -765,6 +779,10 @@ _TITLE_STOPWORDS = {
     # perintah
     "catat", "catatkan", "tambah", "tambahkan", "tambahin", "masukkan", "masukin",
     "input", "buat", "buatkan", "simpan", "hapus", "ubah", "edit", "update",
+    # kata perintah khas update. Tanpa ini, "ubah kopi jadi 30rb" menghasilkan
+    # kata kunci "Kopi Jadi" yang tidak akan pernah cocok dengan judul mana pun.
+    "jadi", "menjadi", "jd", "ganti", "gantikan", "koreksi", "revisi",
+    "perbaiki", "seharusnya", "harusnya",
     # kata generik transaksi
     "transaksi", "pemasukan", "pengeluaran", "income", "expense", "dana", "uang",
     "duit", "saldo", "biaya", "nominal",
@@ -855,7 +873,40 @@ def sanitize_tool_args(tool_name: str, args: dict, user_id: int, user_msg: str) 
             except (ValueError, TypeError):
                 args["limit"] = 10
 
-    elif tool_name in ["update_transaction", "delete_transaction"]:
+    elif tool_name == "update_transaction":
+        # ID yang tidak valid dibuang, bukan dibiarkan. Jika ID bernilai None atau 0
+        # tetap terkirim, MCP akan menganggapnya sebagai selector dan mengabaikan
+        # match_title/match_date yang sebetulnya benar.
+        raw_id = args.get("transaction_id")
+        args.pop("transaction_id", None)
+        if raw_id is not None and str(raw_id).strip() != "":
+            try:
+                parsed_id = int(raw_id)
+                if parsed_id > 0:
+                    args["transaction_id"] = parsed_id
+                else:
+                    print(f"[Sanitize] transaction_id={raw_id!r} tidak masuk akal, diabaikan.")
+            except (ValueError, TypeError):
+                print(f"[Sanitize] transaction_id={raw_id!r} bukan angka, diabaikan.")
+
+        for key in ("match_title", "match_date"):
+            if key in args:
+                cleaned = re.sub(r"\s+", " ", str(args[key] or "")).strip()
+                if cleaned:
+                    args[key] = cleaned
+                else:
+                    args.pop(key)
+
+        # Jaring pengaman: model kadang memanggil update tanpa menyertakan satu pun
+        # selector. Kata kunci dari pesan user dipakai sebagai match_title, dan ini
+        # aman karena MCP hanya mengeksekusi bila kandidatnya tepat satu.
+        if not any(k in args for k in ("transaction_id", "match_title", "match_date")):
+            derived = derive_title_from_message(user_msg)
+            if derived and derived != "Transaksi Baru":
+                args["match_title"] = derived
+                print(f"[Sanitize] update_transaction tanpa selector. match_title disusun dari pesan user -> {derived!r}")
+
+    elif tool_name == "delete_transaction":
         if "transaction_id" in args and args["transaction_id"] is not None:
             try:
                 args["transaction_id"] = int(args["transaction_id"])
@@ -903,7 +954,13 @@ async def chat_with_ai(
         f"1. JANGAN PERNAH memanggil 'create_transaction' jika pengguna hanya BERTANYA, BERKONSULTASI, meminta kalkulasi, atau bertanya hipotetis (contoh: 'berapa pemasukan yang harus saya dapatkan...', 'bagaimana menutupi utang').\n"
         f"2. Panggil 'create_transaction' HANYA JIKA pengguna secara EKSPLISIT memerintahkan untuk MENCATAT/INPUT transaksi baru (contoh perintah: 'catat...', 'tambah...', 'saya baru saja beli...', 'masukkan pengeluaran...').\n"
         f"3. Jika pengguna bertanya tentang kondisi keuangan atau analisis saldo/utang, gunakan 'get_summary' atau 'get_transactions' untuk memeriksa data tanpa menambah transaksi baru.\n"
-        f"4. Jawablah dengan bahasa Indonesia yang ramah, sopan, dan jelas."
+        f"4. Untuk 'update_transaction', pengguna TIDAK perlu menyebut ID. Jika ID tidak diketahui, "
+        f"isi 'match_title' dengan kata kunci judul transaksi dan/atau 'match_date' dengan tanggalnya, "
+        f"lalu kirim nilai barunya pada parameter yang sesuai. Contoh: 'ubah transaksi kopi jadi 30rb' "
+        f"menjadi match_title='kopi' dan amount=30000. Jangan pernah menebak angka ID.\n"
+        f"5. Jika hasil 'update_transaction' berisi beberapa kandidat transaksi, sampaikan daftar kandidat "
+        f"beserta ID-nya kepada pengguna dan minta pengguna memilih. Jangan mengulang update dengan ID tebakan.\n"
+        f"6. Jawablah dengan bahasa Indonesia yang ramah, sopan, dan jelas."
     )
 
 

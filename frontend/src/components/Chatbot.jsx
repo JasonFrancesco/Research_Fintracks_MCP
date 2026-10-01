@@ -78,7 +78,24 @@ const Chatbot = () => {
             });
             setMessages(prev => [...prev, { role: 'ai', text: response.data.response }]);
         } catch (error) {
-            setMessages(prev => [...prev, { role: 'ai', text: 'Maaf, terjadi kesalahan saat menghubungi AI.' }]);
+            // Pesan seragam "gagal menghubungi AI" menyembunyikan penyebab sebenarnya.
+            // Sebagian besar kegagalan di sini bukan soal AI: sesi habis, backend mati,
+            // atau MCP Server belum jalan.
+            console.error('Gagal mengirim pesan ke chatbot:', error);
+            const status = error.response?.status;
+            const detail = error.response?.data?.detail;
+
+            let text;
+            if (status === 401) {
+                text = '🔒 Sesi Anda sudah berakhir. Silakan login ulang, lalu kirim pesan ini kembali.';
+            } else if (!error.response) {
+                text = '🔌 Tidak bisa terhubung ke backend di http://localhost:8000. Pastikan backend sedang berjalan.';
+            } else if (status >= 500) {
+                text = `⚠️ Backend mengalami error (HTTP ${status}). Periksa terminal backend untuk detailnya.${detail ? `\n\n${detail}` : ''}`;
+            } else {
+                text = `⚠️ Permintaan ditolak (HTTP ${status}).${detail ? `\n\n${detail}` : ''}`;
+            }
+            setMessages(prev => [...prev, { role: 'ai', text }]);
         } finally {
             setIsLoading(false);
         }
