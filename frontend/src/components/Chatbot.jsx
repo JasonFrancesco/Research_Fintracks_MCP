@@ -1,6 +1,97 @@
 import React, { useState, useEffect, useRef } from 'react';
 import api from '../services/api';
 
+// Clipboard API hanya tersedia di secure context (https atau localhost).
+// Kalau frontend dibuka lewat IP LAN, misalnya http://192.168.x.x:3000,
+// navigator.clipboard tidak ada, jadi dipakai cara lama lewat textarea.
+const copyToClipboard = async (text) => {
+    if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return;
+    }
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+        if (!document.execCommand('copy')) throw new Error('execCommand copy gagal');
+    } finally {
+        document.body.removeChild(textarea);
+    }
+};
+
+// Pesan hari ini cukup jamnya ("14:05"). Pesan dari hari lain diberi tanggal
+// ("29 Sep 14:05"), karena riwayat chat bisa berumur beberapa hari dan jam saja
+// tidak menjelaskan kapan pesan itu dikirim.
+const formatChatTime = (value) => {
+    if (!value) return '';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+
+    const time = date.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+    const now = new Date();
+    const sameDay = date.toDateString() === now.toDateString();
+    if (sameDay) return time;
+
+    const day = date.toLocaleDateString('id-ID', {
+        day: 'numeric',
+        month: 'short',
+        ...(date.getFullYear() !== now.getFullYear() && { year: 'numeric' }),
+    });
+    return `${day} ${time}`;
+};
+
+const CopyButton = ({ text, isUser }) => {
+    const [status, setStatus] = useState('idle'); // 'idle' | 'copied' | 'error'
+    const timerRef = useRef(null);
+
+    useEffect(() => () => clearTimeout(timerRef.current), []);
+
+    const handleCopy = async () => {
+        try {
+            await copyToClipboard(text);
+            setStatus('copied');
+        } catch (error) {
+            console.error('Gagal menyalin pesan:', error);
+            setStatus('error');
+        }
+        clearTimeout(timerRef.current);
+        timerRef.current = setTimeout(() => setStatus('idle'), 2000);
+    };
+
+    const label = status === 'copied' ? 'Tersalin' : status === 'error' ? 'Gagal' : 'Salin';
+
+    return (
+        <button
+            type="button"
+            onClick={handleCopy}
+            className={`mt-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+                status === 'copied'
+                    ? 'text-green-600'
+                    : status === 'error'
+                        ? 'text-red-500'
+                        : 'text-gray-400 hover:text-gray-700 hover:bg-gray-100'
+            } ${isUser ? 'self-end' : 'self-start'}`}
+            aria-label={status === 'copied' ? 'Pesan tersalin' : 'Salin pesan'}
+            title="Salin pesan"
+        >
+            {status === 'copied' ? (
+                <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                </svg>
+            ) : (
+                <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+            )}
+            <span aria-live="polite">{label}</span>
+        </button>
+    );
+};
+
 const Chatbot = () => {
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState('');
@@ -66,7 +157,9 @@ const Chatbot = () => {
         e.preventDefault();
         if (!input.trim()) return;
 
-        const userMessage = { role: 'user', text: input };
+        // Pesan baru belum punya created_at dari database, jadi dicap jam lokal.
+        // Setelah halaman dimuat ulang, jam diambil dari riwayat di backend.
+        const userMessage = { role: 'user', text: input, created_at: new Date().toISOString() };
         setMessages(prev => [...prev, userMessage]);
         setInput('');
         setIsLoading(true);
@@ -76,7 +169,7 @@ const Chatbot = () => {
                 message: input,
                 model: selectedModel
             });
-            setMessages(prev => [...prev, { role: 'ai', text: response.data.response }]);
+            setMessages(prev => [...prev, { role: 'ai', text: response.data.response, created_at: new Date().toISOString() }]);
         } catch (error) {
             // Pesan seragam "gagal menghubungi AI" menyembunyikan penyebab sebenarnya.
             // Sebagian besar kegagalan di sini bukan soal AI: sesi habis, backend mati,
@@ -95,7 +188,7 @@ const Chatbot = () => {
             } else {
                 text = `⚠️ Permintaan ditolak (HTTP ${status}).${detail ? `\n\n${detail}` : ''}`;
             }
-            setMessages(prev => [...prev, { role: 'ai', text }]);
+            setMessages(prev => [...prev, { role: 'ai', text, created_at: new Date().toISOString() }]);
         } finally {
             setIsLoading(false);
         }
@@ -179,11 +272,23 @@ const Chatbot = () => {
                     </div>
                 ) : (
                     messages.map((msg, i) => (
-                        <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                        <div key={i} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
                             <div className={`max-w-[85%] p-3 rounded-2xl text-sm whitespace-pre-wrap leading-relaxed ${
                                 msg.role === 'user' ? 'bg-blue-600 text-white rounded-tr-none' : 'bg-white text-gray-800 border border-gray-200 rounded-tl-none shadow-sm'
                             }`}>
                                 {msg.text}
+                            </div>
+                            <div className={`flex items-center gap-1 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
+                                {formatChatTime(msg.created_at) && (
+                                    <time
+                                        dateTime={msg.created_at}
+                                        title={new Date(msg.created_at).toLocaleString('id-ID')}
+                                        className="mt-1 px-1 text-[11px] text-gray-400"
+                                    >
+                                        {formatChatTime(msg.created_at)}
+                                    </time>
+                                )}
+                                {msg.text && <CopyButton text={msg.text} isUser={msg.role === 'user'} />}
                             </div>
                         </div>
                     ))
