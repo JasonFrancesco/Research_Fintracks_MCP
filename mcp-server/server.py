@@ -1,11 +1,11 @@
 import os
 import sys
+import asyncio
 import argparse
 from pathlib import Path
-from typing import Optional, Dict, Any
-from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
+
+import anyio
 from mcp.server.fastmcp import FastMCP
 
 # Ensure mcp-server root directory is in sys.path
@@ -13,7 +13,6 @@ server_dir = str(Path(__file__).resolve().parent)
 if server_dir not in sys.path:
     sys.path.insert(0, server_dir)
 
-from config import get_db_session, MCP_API_KEY
 from tools.transaction_tools import (
     create_transaction_tool,
     get_transactions_tool,
@@ -22,10 +21,22 @@ from tools.transaction_tools import (
     get_summary_tool
 )
 
-# Inisialisasi FastMCP Server (Sesuai pola FastMCP pada tutorial YouTube)
+# Port & path endpoint MCP HTTP streamable. Backend terhubung ke
+# http://127.0.0.1:8001/mcp sebagai MCP client (protokol MCP, bukan REST).
+MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1")
+MCP_PORT = int(os.getenv("MCP_PORT", "8001"))
+MCP_PATH = os.getenv("MCP_PATH", "/mcp")
+
+# Inisialisasi FastMCP Server dengan transport HTTP streamable.
+# stateless_http=True: tiap request MCP berdiri sendiri tanpa sesi persisten,
+# cocok untuk backend yang connect-list-call-close per permintaan chat.
 mcp = FastMCP(
     name="FinTracks MCP Server",
-    instructions="MCP Server untuk pencatatan dan pengelolaan keuangan pribadi FinTracks"
+    instructions="MCP Server untuk pencatatan dan pengelolaan keuangan pribadi FinTracks",
+    host=MCP_HOST,
+    port=MCP_PORT,
+    streamable_http_path=MCP_PATH,
+    stateless_http=True,
 )
 
 # Registrasi Tools menggunakan Decorator @mcp.tool()
@@ -39,13 +50,42 @@ def create_transaction(
     date: str,
     note: Optional[str] = None
 ) -> str:
-    """Catat transaksi keuangan baru (income atau expense). Format tanggal 'YYYY-MM-DD'."""
+    """
+    Catat transaksi keuangan baru (pemasukan/gaji atau pengeluaran/pembelian).
+
+    - amount: nominal Rupiah tanpa simbol (25000 untuk 25rb, 1500000 untuk 1.5 juta).
+    - category: pilih salah satu dari 'Makanan & Minuman', 'Transportasi', 'Belanja',
+      'Pendapatan', 'Kesehatan', 'Hiburan', 'Tagihan', 'Lainnya'.
+    - transaction_type: 'expense' untuk pengeluaran/beli/bayar, 'income' untuk
+      pemasukan/gaji/terima uang.
+    - date: format YYYY-MM-DD. Pakai tanggal hari ini jika pengguna tidak menyebut tanggal.
+    """
     return create_transaction_tool(user_id, title, amount, category, transaction_type, date, note)
 
 @mcp.tool()
-def get_transactions(user_id: int, limit: int = 10) -> str:
-    """Mengambil daftar riwayat transaksi keuangan terbaru untuk user tertentu."""
-    return get_transactions_tool(user_id, limit)
+def get_transactions(
+    user_id: int,
+    limit: int = 10,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    transaction_type: Optional[str] = None,
+) -> str:
+    """
+    Mengambil riwayat/daftar transaksi keuangan milik pengguna, terbaru lebih dulu.
+
+    Semua filter opsional. WAJIB dipakai bila pengguna menyebut tanggal atau jenis
+    transaksi, jangan memilah sendiri dari daftar tanpa filter.
+    - limit: jumlah transaksi yang ditampilkan, default 10.
+    - start_date: tanggal YYYY-MM-DD. Untuk SATU tanggal (contoh "pengeluaran tanggal 29
+      September"), isi start_date saja.
+    - end_date: tanggal akhir YYYY-MM-DD, dipakai untuk rentang (contoh "minggu ini",
+      "bulan September": start_date=2026-09-01, end_date=2026-09-30).
+    - transaction_type: 'expense' untuk pengeluaran, 'income' untuk pemasukan.
+
+    Jika filter dipakai, hasil memuat jumlah dan total nominal yang sudah dihitung.
+    Jika tidak ada data, hasil menyatakannya secara eksplisit; sampaikan apa adanya.
+    """
+    return get_transactions_tool(user_id, limit, start_date, end_date, transaction_type)
 
 @mcp.tool()
 def update_transaction(
@@ -100,66 +140,41 @@ def get_summary(user_id: int) -> str:
     return get_summary_tool(user_id)
 
 
-# FastAPI Wrapper untuk melayani HTTP Request dari Web App FinTracks
-app = FastAPI(title="FinTracks MCP Server API")
+# Aplikasi ASGI MCP HTTP streamable. Di-expose di level modul agar bisa
+# dijalankan dengan: uvicorn server:app_http --host 127.0.0.1 --port 8001
+app_http = mcp.streamable_http_app()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class ToolCallRequest(BaseModel):
-    name: str
-    arguments: Dict[str, Any] = {}
-    api_key: Optional[str] = None
-
-def verify_api_key(api_key: Optional[str]):
-    if not api_key or api_key != MCP_API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid or missing API Key")
-
-@app.get("/")
-def root():
-    return {
-        "status": "online",
-        "server": mcp.name,
-        "framework": "FastMCP",
-        "port": 8001,
-        "tools": [t.name for t in mcp._tool_manager.list_tools()]
-    }
-
-@app.get("/tools")
-def list_tools():
-    return {"tools": [t.name for t in mcp._tool_manager.list_tools()]}
-
-@app.post("/call")
-async def call_tool(req: ToolCallRequest):
-    verify_api_key(req.api_key)
-    try:
-        res, extra = await mcp.call_tool(req.name, req.arguments)
-        text_output = "\n".join([c.text for c in res if hasattr(c, "text")])
-        return {"success": True, "result": text_output}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FinTracks FastMCP Server")
-    parser.add_argument("--stdio", action="store_true", help="Menjalankan server dalam mode stdio MCP standar")
+    parser.add_argument(
+        "--stdio",
+        action="store_true",
+        help="Jalankan sebagai MCP server stdio (untuk Claude Desktop / Cursor)",
+    )
     args = parser.parse_args()
 
     if args.stdio:
-        # Mode Stdio MCP Standar (untuk Claude Desktop / Cursor / Antigravity MCP Client)
+        # Mode stdio MCP standar: server bicara protokol MCP lewat stdin/stdout.
         mcp.run(transport="stdio")
     else:
-        # Mode HTTP Server (untuk koneksi Backend FastAPI & Web App)
-        import uvicorn
+        # Mode HTTP streamable: protokol MCP di atas HTTP, dipakai backend web app.
         print("==================================================")
-        print(f"[FinTracks] {mcp.name} (FastMCP) berjalan di port 8001!")
-        print("   HTTP API: http://127.0.0.1:8001")
-        print("   Stdio Mode: python server.py --stdio")
+        print(f"[FinTracks] {mcp.name} (FastMCP, HTTP streamable)")
+        print(f"   Endpoint MCP : http://{MCP_HOST}:{MCP_PORT}{MCP_PATH}")
+        print(f"   Mode stdio   : python server.py --stdio")
         print("==================================================")
-        uvicorn.run(app, host="127.0.0.1", port=8001)
+        # Setara dengan mcp.run(transport="streamable-http"), tetapi di Windows
+        # memakai SelectorEventLoop. Event loop default Windows (ProactorEventLoop)
+        # mencetak "ERROR Exception in callback _ProactorBasePipeTransport.
+        # _call_connection_lost ... connection was forcibly closed by the remote host"
+        # setiap kali client memutus koneksi lebih dulu. Request-nya sendiri sudah
+        # selesai (200 OK), tetapi traceback itu membanjiri log. Selector loop tidak
+        # punya jalur kode tersebut. Kekurangannya, selector loop di Windows tidak
+        # mendukung subprocess, dan mode HTTP ini memang tidak memakainya.
+        backend_options = (
+            {"loop_factory": asyncio.SelectorEventLoop} if sys.platform == "win32" else {}
+        )
+        anyio.run(mcp.run_streamable_http_async, backend_options=backend_options)
 
 

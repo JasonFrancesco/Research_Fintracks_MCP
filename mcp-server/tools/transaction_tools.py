@@ -194,17 +194,130 @@ def create_transaction_tool(user_id: int, title: str, amount: float, category: s
     finally:
         db.close()
 
-def get_transactions_tool(user_id: int, limit: int = 10):
+_TYPE_ALIASES = {
+    "income": "income", "pemasukan": "income", "masuk": "income",
+    "expense": "expense", "pengeluaran": "expense", "keluar": "expense",
+}
+_TYPE_LABEL = {"income": "pemasukan", "expense": "pengeluaran"}
+
+
+def get_transactions_tool(
+    user_id: int,
+    limit: int = 10,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    transaction_type: Optional[str] = None,
+):
     """
-    Mengambil daftar transaksi terbaru untuk user tertentu.
+    Mengambil daftar transaksi user, terbaru lebih dulu.
+
+    Filter opsional:
+      - start_date / end_date (YYYY-MM-DD, inklusif). Jika hanya start_date yang
+        diisi, dianggap satu hari saja, sehingga "pengeluaran tanggal 29" cukup
+        dengan start_date.
+      - transaction_type: 'income' atau 'expense' (alias Indonesia diterima).
+
+    Filter dikerjakan di database, bukan diserahkan ke model. Model kecil sering
+    salah memilah daftar campuran, dan cenderung menjawab dengan transaksi lain
+    ketika yang ditanyakan sebenarnya tidak ada.
     """
     db: Session = get_db_session()
     try:
-        txs = db.query(Transaction).filter(Transaction.user_id == int(user_id)).order_by(Transaction.transaction_date.desc()).limit(limit).all()
-        if not txs:
-            return "Tidak ada transaksi yang ditemukan."
+        # Query dasar: hanya transaksi milik user ini. Semua filter menempel ke sini.
+        base = db.query(Transaction).filter(Transaction.user_id == int(user_id))
 
-        return "\n".join(_format_tx_line(t) for t in txs)
+        # Tanpa filter: output identik dengan versi lama, agar hasil benchmark lama
+        # tetap bisa dibandingkan untuk pertanyaan "tampilkan transaksi saya".
+        has_filter = bool(start_date or end_date or transaction_type)
+        if not has_filter:
+            # Ambil N transaksi terbaru (urut tanggal menurun), lalu format jadi teks.
+            txs = base.order_by(Transaction.transaction_date.desc()).limit(limit).all()
+            if not txs:
+                return "Tidak ada transaksi yang ditemukan."
+            return "\n".join(_format_tx_line(t) for t in txs)
+
+        # --- Validasi filter. Input tidak valid ditolak, bukan diabaikan diam-diam,
+        # karena mengabaikan filter berarti menjawab pertanyaan yang berbeda.
+        tx_type = None
+        if transaction_type:
+            tx_type = _TYPE_ALIASES.get(str(transaction_type).strip().lower())
+            if tx_type is None:
+                return f"Jenis transaksi '{transaction_type}' tidak valid. Gunakan 'income' atau 'expense'."
+
+        start = _parse_date_strict(start_date) if start_date else None
+        end = _parse_date_strict(end_date) if end_date else None
+        if start_date and start is None:
+            return f"Tanggal mulai '{start_date}' tidak dikenali. Gunakan format YYYY-MM-DD."
+        if end_date and end is None:
+            return f"Tanggal akhir '{end_date}' tidak dikenali. Gunakan format YYYY-MM-DD."
+        if start and not end:
+            end = start  # hanya satu tanggal -> satu hari
+        if start and end and start > end:
+            start, end = end, start
+
+        # Terapkan filter tanggal. date_q = query dengan filter tanggal saja
+        # (dipakai lagi di bawah untuk menghitung "ada berapa jenis lain").
+        date_q = base
+        if start:
+            # >= awal hari start (jam 00:00)
+            date_q = date_q.filter(Transaction.transaction_date >= start.replace(hour=0, minute=0, second=0, microsecond=0))
+        if end:
+            # < awal hari BERIKUTNYA setelah end, supaya tanggal 'end' ikut terhitung penuh
+            date_q = date_q.filter(Transaction.transaction_date < end.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1))
+
+        # query = date_q + filter jenis (kalau diminta). Inilah hasil akhir yang dihitung.
+        query = date_q.filter(Transaction.transaction_type == tx_type) if tx_type else date_q
+
+        # --- Deskripsi filter untuk kalimat jawaban
+        if start and end and start.date() == end.date():
+            period = f"pada tanggal {start.strftime('%Y-%m-%d')}"
+        elif start and end:
+            period = f"pada {start.strftime('%Y-%m-%d')} s.d. {end.strftime('%Y-%m-%d')}"
+        elif end:
+            period = f"sampai {end.strftime('%Y-%m-%d')}"
+        else:
+            period = ""
+        kind = _TYPE_LABEL[tx_type] if tx_type else "transaksi"
+        scope = f"{kind} {period}".strip()
+
+        # matched = berapa transaksi yang cocok filter. Dihitung di DB (cepat & akurat).
+        matched = query.count()
+        if matched == 0:
+            # Jawaban tegas "tidak ada" — ini kunci perbaikan kasus "pengeluaran tgl 29".
+            msg = f"Tidak ada {scope}."
+            # Beri tahu apa yang sebenarnya ada pada periode itu, supaya model tidak
+            # tergoda mengisi jawaban dengan transaksi dari tanggal lain.
+            if tx_type and period:
+                other = date_q.filter(Transaction.transaction_type != tx_type).count()
+                if other:
+                    other_label = _TYPE_LABEL["income" if tx_type == "expense" else "expense"]
+                    msg += f" Pada periode tersebut hanya ada {other} {other_label}."
+            return msg
+
+        # Total dihitung di database atas SELURUH hasil filter, bukan hanya baris yang
+        # ditampilkan. Model 3B rawan salah menjumlahkan, jadi angkanya diberikan jadi.
+        # Hitung total nominal per jenis LANGSUNG di database (SUM + GROUP BY),
+        # bukan dijumlahkan oleh model yang rawan salah hitung.
+        totals = dict(
+            query.with_entities(Transaction.transaction_type, func.sum(Transaction.amount))
+            .group_by(Transaction.transaction_type)
+            .all()
+        )
+        # Ambil barisnya (dibatasi limit) untuk ditampilkan. Total di atas tetap
+        # mencakup SEMUA yang cocok, bukan cuma yang ditampilkan.
+        txs = query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc()).limit(limit).all()
+
+        # Rakit header ringkasan: jumlah transaksi + total per jenis.
+        header = [f"Ditemukan {matched} {scope}."]
+        for t_type in ("expense", "income"):
+            if t_type in totals:
+                header.append(f"Total {_TYPE_LABEL[t_type]}: Rp {float(totals[t_type] or 0):,.2f}")
+        if matched > len(txs):
+            # Jujur beri tahu kalau ada baris yang tidak ditampilkan karena limit.
+            header.append(f"Menampilkan {len(txs)} dari {matched} transaksi (dibatasi limit={limit}).")
+
+        # Gabung header + daftar transaksi jadi satu teks balasan.
+        return "\n".join(header) + "\n" + "\n".join(_format_tx_line(t) for t in txs)
     except Exception as e:
         return f"Gagal mengambil data: {str(e)}"
     finally:

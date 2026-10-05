@@ -3,7 +3,7 @@ import re
 import json
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
@@ -32,7 +32,10 @@ class ChatMessageItem(BaseModel):
     text: str
     created_at: Optional[datetime] = None
 
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8001/call")
+# Lapisan MCP client: backend bicara ke mcp-server lewat protokol MCP
+# (tools/list + tools/call), bukan REST. Menggantikan MCP_SERVER_URL + call_mcp_tool.
+from ..mcp import client as mcp_client
+from ..mcp.schema_adapter import mcp_tools_to_llm_schema
 
 # Nilai awal sebagai cadangan. JANGAN dipakai langsung untuk request: konstanta
 # modul hanya dibaca sekali saat import, sehingga perubahan .env tidak terbaca
@@ -629,149 +632,13 @@ def query_llm(preset_id: str, messages: list, tools: list = None) -> tuple[Optio
         except Exception as e:
             return None, f"🤖 **FinTracks AI (Lokal Error):** {type(e).__name__}: {str(e)}"
 
-# Skema resmi MCP Tools yang di-expose ke LLM (Sesuai Spesifikasi MCP Function Calling)
-TOOLS_SCHEMA = [
-    {
-        "type": "function",
-        "function": {
-            "name": "create_transaction",
-            "description": "Catat transaksi keuangan baru (pemasukan/gaji atau pengeluaran/pembelian) ke dalam database.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "Judul atau deskripsi transaksi (contoh: Makan Siang Nasi Goreng, Beli Kopi Starbucks, Gaji Bulanan)."
-                    },
-                    "amount": {
-                        "type": "number",
-                        "description": "Nominal transaksi dalam angka Rupiah tanpa simbol (contoh: 25000 untuk 25 ribu/25k, 1500000 untuk 1.5 juta)."
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "Kategori transaksi. Pilih dari: 'Makanan & Minuman', 'Transportasi', 'Belanja', 'Pendapatan', 'Kesehatan', 'Hiburan', 'Tagihan', atau 'Lainnya'."
-                    },
-                    "transaction_type": {
-                        "type": "string",
-                        "enum": ["income", "expense"],
-                        "description": "Jenis transaksi: 'expense' untuk pengeluaran/beli/bayar, 'income' untuk pemasukan/gaji/terima uang."
-                    },
-                    "date": {
-                        "type": "string",
-                        "description": "Tanggal transaksi format YYYY-MM-DD. Gunakan tanggal hari ini jika pengguna tidak menyebutkan tanggal spesifik."
-                    },
-                    "note": {
-                        "type": "string",
-                        "description": "Catatan tambahan opsional."
-                    }
-                },
-                "required": ["title", "amount", "category", "transaction_type", "date"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_transactions",
-            "description": "Mengambil riwayat atau daftar transaksi keuangan terbaru milik pengguna.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Jumlah transaksi terbaru yang ingin diambil (default 10)."
-                    }
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_summary",
-            "description": "Mendapatkan ringkasan statistik keuangan (Total Pemasukan, Total Pengeluaran, dan Saldo akhir).",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "update_transaction",
-            "description": (
-                "Mengubah data transaksi yang sudah ada. Transaksi target ditentukan lewat "
-                "transaction_id, atau lewat match_title dan/atau match_date bila ID tidak diketahui. "
-                "WAJIB mengisi minimal satu dari ketiganya. Jika kriteria pencarian cocok dengan "
-                "lebih dari satu transaksi, tidak ada yang diubah dan tool mengembalikan daftar "
-                "kandidat beserta ID-nya untuk dikonfirmasi ke pengguna."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "transaction_id": {
-                        "type": "integer",
-                        "description": "PENCARIAN. ID transaksi numerik. Gunakan ini jika pengguna menyebut ID, atau jika ID sudah terlihat pada daftar transaksi di percakapan sebelumnya."
-                    },
-                    "match_title": {
-                        "type": "string",
-                        "description": "PENCARIAN, bukan nilai baru. Kata kunci judul transaksi yang ingin dicari ketika pengguna tidak menyebut ID. Contoh: pengguna berkata 'ubah transaksi kopi jadi 30rb' maka match_title='kopi'. Ambil hanya kata kunci bendanya, tanpa kata perintah dan tanpa nominal."
-                    },
-                    "match_date": {
-                        "type": "string",
-                        "description": "PENCARIAN, bukan nilai baru. Tanggal transaksi yang ingin dicari, format YYYY-MM-DD. Contoh: pengguna berkata 'ubah pengeluaran tanggal 5 Oktober' maka match_date='2026-10-05'. Boleh dikombinasikan dengan match_title."
-                    },
-                    "title": {"type": "string", "description": "NILAI BARU untuk judul (opsional). Isi hanya jika pengguna ingin mengganti judulnya."},
-                    "amount": {"type": "number", "description": "NILAI BARU untuk nominal dalam angka Rupiah tanpa simbol (opsional)."},
-                    "category": {"type": "string", "description": "NILAI BARU untuk kategori (opsional)."},
-                    "transaction_type": {"type": "string", "enum": ["income", "expense"], "description": "NILAI BARU untuk jenis transaksi (opsional)."},
-                    "date": {"type": "string", "description": "NILAI BARU untuk tanggal transaksi, format YYYY-MM-DD (opsional). Jangan pakai ini untuk mencari transaksi, gunakan match_date."},
-                    "note": {"type": "string", "description": "NILAI BARU untuk catatan (opsional)."}
-                },
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "delete_transaction",
-            "description": "Menghapus catatan transaksi keuangan berdasarkan ID transaksi.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "transaction_id": {
-                        "type": "integer",
-                        "description": "ID transaksi numerik yang ingin dihapus."
-                    }
-                },
-                "required": ["transaction_id"]
-            }
-        }
-    }
-]
-
-def call_mcp_tool(tool_name: str, arguments: dict) -> Optional[str]:
-    """Memanggil tool pada MCP Server (port 8001)"""
-    try:
-        api_key = os.getenv("MCP_API_KEY", "default-dev-key-123")
-        payload = {
-            "name": tool_name,
-            "arguments": arguments,
-            "api_key": api_key
-        }
-        res = requests.post(MCP_SERVER_URL, json=payload, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            if data.get("success"):
-                return str(data.get("result"))
-            else:
-                return f"Error dari MCP Server: {data.get('error')}"
-    except Exception as e:
-        print(f"Error calling MCP Tool {tool_name}: {e}")
-        return f"Gagal terhubung ke MCP Server: {e}"
-    return None
+# CATATAN ARSITEKTUR MCP:
+# Daftar tool TIDAK lagi ditulis manual di sini. Dulu ada konstanta TOOLS_SCHEMA
+# dan fungsi call_mcp_tool yang menembak REST POST /call. Keduanya dihapus.
+# Sekarang backend bertindak sebagai MCP client: skema tool diambil dari server
+# via tools/list (app.mcp.client.list_tools) lalu diterjemahkan oleh schema_adapter,
+# dan eksekusi tool lewat tools/call (app.mcp.client.call_tool). Server adalah
+# satu-satunya sumber kebenaran definisi tool.
 
 # Kata-kata yang tidak layak menjadi judul transaksi: perintah, satuan nominal,
 # keterangan waktu, dan preposisi. Dipakai saat model gagal mengirim 'title'.
@@ -816,6 +683,100 @@ def derive_title_from_message(user_msg: str, category: Optional[str] = None) -> 
 
     # Pertahankan kapitalisasi asli bila user sudah menulisnya kapital (nama merek, dll)
     return " ".join(w if w[:1].isupper() else w.capitalize() for w in words[:5])
+
+
+_MONTHS_ID = {
+    "januari": 1, "jan": 1, "februari": 2, "feb": 2, "maret": 3, "mar": 3,
+    "april": 4, "apr": 4, "mei": 5, "may": 5, "juni": 6, "jun": 6, "juli": 7, "jul": 7,
+    "agustus": 8, "agu": 8, "agt": 8, "aug": 8, "september": 9, "sept": 9, "sep": 9,
+    "oktober": 10, "okt": 10, "oct": 10, "november": 11, "nov": 11,
+    "desember": 12, "des": 12, "dec": 12,
+}
+_MONTH_RE = "|".join(sorted(_MONTHS_ID, key=len, reverse=True))
+
+
+def _safe_date(year: int, month: int, day: int) -> Optional[datetime]:
+    try:
+        return datetime(year, month, day)
+    except ValueError:
+        return None
+
+
+def _extract_single_date(user_msg: str, now: datetime) -> Optional[str]:
+    """
+    Mengambil SATU tanggal eksplisit dari pesan user, format YYYY-MM-DD.
+    Mengembalikan None bila tidak ada tanggal atau ada lebih dari satu tanggal berbeda.
+
+    Dikenali: '2026-09-29', '29/09/2026', '29/9', '29 september (2026)',
+    'tanggal 29' / 'tgl 29', 'hari ini', 'kemarin'. Angka lepas seperti '50 ribu'
+    sengaja tidak dianggap tanggal. Tanggal tanpa bulan/tahun diartikan sebagai
+    tanggal terdekat yang sudah lewat, karena pertanyaan riwayat transaksi selalu
+    menyangkut masa lalu.
+    """
+    text = user_msg.lower()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    found = set()
+
+    def most_recent(day: int, month: Optional[int] = None) -> Optional[datetime]:
+        if month is None:
+            # Bulan ini kalau tanggalnya sudah lewat, selain itu bulan lalu.
+            for back in range(0, 3):
+                m = today.month - back
+                y = today.year
+                while m < 1:
+                    m += 12
+                    y -= 1
+                d = _safe_date(y, m, day)
+                if d and d <= today:
+                    return d
+            return None
+        d = _safe_date(today.year, month, day)
+        if d and d > today:
+            d = _safe_date(today.year - 1, month, day)
+        return d
+
+    for m in re.finditer(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", text):
+        d = _safe_date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if d:
+            found.add(d)
+    for m in re.finditer(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{4}))?\b", text):
+        day, month = int(m.group(1)), int(m.group(2))
+        d = _safe_date(int(m.group(3)), month, day) if m.group(3) else most_recent(day, month)
+        if d:
+            found.add(d)
+    for m in re.finditer(rf"\b(\d{{1,2}})\s+({_MONTH_RE})\b\.?(?:\s+(\d{{4}}))?", text):
+        day, month = int(m.group(1)), _MONTHS_ID[m.group(2)]
+        d = _safe_date(int(m.group(3)), month, day) if m.group(3) else most_recent(day, month)
+        if d:
+            found.add(d)
+    for m in re.finditer(rf"\b(?:tanggal|tgl)\.?\s+(\d{{1,2}})\b(?!\s*(?:{_MONTH_RE})\b)(?![/-]\d)", text):
+        d = most_recent(int(m.group(1)))
+        if d:
+            found.add(d)
+    if re.search(r"\bhari ini\b", text):
+        found.add(today)
+    if re.search(r"\bkemarin\b", text):
+        found.add(today - timedelta(days=1))
+
+    if len(found) == 1:
+        return next(iter(found)).strftime("%Y-%m-%d")
+    return None
+
+
+# Kata yang menandakan pengguna meminta rentang tanggal, bukan satu hari.
+_RANGE_WORDS = re.compile(r"\b(sampai|hingga|s\.?d\.?|sd|antara|dari|sejak|selama|minggu|bulan)\b")
+
+
+def _extract_tx_type(user_msg: str) -> Optional[str]:
+    """'expense'/'income' bila pesan menyebut tepat satu jenis transaksi, selain itu None."""
+    text = user_msg.lower()
+    is_expense = bool(re.search(r"\b(pengeluaran|expense)\b", text))
+    is_income = bool(re.search(r"\b(pemasukan|pendapatan|income)\b", text))
+    if is_expense and not is_income:
+        return "expense"
+    if is_income and not is_expense:
+        return "income"
+    return None
 
 
 def sanitize_tool_args(tool_name: str, args: dict, user_id: int, user_msg: str) -> dict:
@@ -873,6 +834,40 @@ def sanitize_tool_args(tool_name: str, args: dict, user_id: int, user_msg: str) 
             except (ValueError, TypeError):
                 args["limit"] = 10
 
+        # Model kecil sering mengirim filter kosong ("", null, "none") untuk parameter
+        # yang tidak relevan. Dibuang agar tool memakai default "tanpa filter", bukan
+        # menolak string kosong sebagai tanggal yang tidak valid.
+        for key in ("start_date", "end_date", "transaction_type"):
+            if key in args:
+                val = str(args[key] or "").strip()
+                if not val or val.lower() in ("none", "null", "all", "semua"):
+                    args.pop(key)
+                else:
+                    args[key] = val
+
+        # Model 3B sering salah mengubah tanggal di pesan menjadi parameter. Teramati
+        # pada llama3.2:3b: "tanggal 29" -> tanggal hari ini atau 29 bulan depan, dan
+        # "tanggal 30" -> rentang dari hari ini sampai tanggal 30. Jika pesan user
+        # memuat TEPAT satu tanggal dan tidak memakai kata rentang, filter dipaksa ke
+        # hari itu. Nilai asli model tetap tercatat di log [BENCHMARK] RAW, jadi
+        # penilaian kemampuan model tidak ikut "terbantu".
+        explicit = _extract_single_date(user_msg, datetime.now())
+        if explicit and not _RANGE_WORDS.search(user_msg.lower()):
+            if args.get("start_date") != explicit or args.get("end_date") not in (None, explicit):
+                print(f"[Sanitize] Tanggal di pesan user = {explicit}, model mengirim "
+                      f"start_date={args.get('start_date')!r} end_date={args.get('end_date')!r}. "
+                      f"Dikoreksi ke satu hari {explicit}.")
+            args["start_date"] = explicit
+            args.pop("end_date", None)
+
+        # Jenis transaksi: teramati model mengirim 'expense' untuk pertanyaan
+        # "pemasukan tanggal 29". Bila pesan menyebut tepat satu jenis, itu yang dipakai.
+        msg_type = _extract_tx_type(user_msg)
+        if msg_type and args.get("transaction_type") != msg_type:
+            print(f"[Sanitize] Jenis di pesan user = {msg_type}, model mengirim "
+                  f"transaction_type={args.get('transaction_type')!r}. Dikoreksi.")
+            args["transaction_type"] = msg_type
+
     elif tool_name == "update_transaction":
         # ID yang tidak valid dibuang, bukan dibiarkan. Jika ID bernilai None atau 0
         # tetap terkirim, MCP akan menganggapnya sebagai selector dan mengabaikan
@@ -921,14 +916,17 @@ async def chat_with_ai(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    user_msg = request.message.strip()
-    user_id = current_user.id
-    preset = resolve_preset(request.model)
+    # Endpoint POST /chat/. Ini "otak" alur: menerima pesan dari Chatbot.jsx,
+    # mengorkestrasi LLM + MCP, lalu mengembalikan jawaban akhir.
+    # current_user sudah diisi oleh get_current_user (hasil verifikasi token JWT).
+    user_msg = request.message.strip()         # teks pesan pengguna
+    user_id = current_user.id                  # pemilik data; TIDAK diambil dari input mentah
+    preset = resolve_preset(request.model)     # terjemahkan 'local'/'gpt'/'gemma' -> konfigurasi model
     model_mode = preset["id"]
     model_label = f"{preset['id']} ({preset['model']})"
     today_str = datetime.now().strftime("%Y-%m-%d")
 
-    # 1. Simpan pesan user ke database
+    # 1. Simpan pesan user ke database (untuk riwayat & memory percakapan)
     save_chat_message(db, user_id, "user", user_msg)
 
     # 2. Ambil riwayat percakapan sebelumnya untuk konteks memory AI (maks 10 pesan terakhir)
@@ -946,7 +944,10 @@ async def chat_with_ai(
         f"User ID: {user_id}. Tanggal hari ini: {today_str}.\n"
         f"Anda memiliki akses ke MCP Tools untuk mengelola data keuangan pengguna:\n"
         f"- create_transaction: Mencatat transaksi baru (pemasukan/pengeluaran).\n"
-        f"- get_transactions: Melihat riwayat transaksi.\n"
+        f"- get_transactions: Melihat riwayat transaksi. Jika pengguna menyebut tanggal atau "
+        f"jenis (pemasukan/pengeluaran), WAJIB isi start_date/end_date dan transaction_type. "
+        f"Jika pengguna menyebut tanggal tanpa bulan (contoh 'tanggal 29'), pakai tanggal 29 "
+        f"terdekat yang SUDAH LEWAT dari hari ini, jangan tanggal di masa depan.\n"
         f"- get_summary: Melihat ringkasan pemasukan, pengeluaran, dan saldo.\n"
         f"- update_transaction: Mengubah transaksi yang sudah ada.\n"
         f"- delete_transaction: Menghapus transaksi.\n\n"
@@ -961,49 +962,78 @@ async def chat_with_ai(
         f"5. Jika hasil 'update_transaction' berisi beberapa kandidat transaksi, sampaikan daftar kandidat "
         f"beserta ID-nya kepada pengguna dan minta pengguna memilih. Jangan mengulang update dengan ID tebakan.\n"
         f"6. Jawablah dengan bahasa Indonesia yang ramah, sopan, dan jelas."
+        f"7. AI Models harus pintar dan jelas dalam memutuskan tool mana yang dipanggil kemudian harus menjawab dengan jelas."
     )
 
 
+    # Susun daftar pesan untuk LLM: system prompt dulu, lalu riwayat lama,
+    # terakhir pesan user saat ini. Format {role, content} ini standar chat LLM.
     messages = [{"role": "system", "content": system_prompt}]
-    for rec in past_history[:-1]:
+    for rec in past_history[:-1]:  # [:-1] = kecualikan pesan user terakhir (ditambah manual di bawah)
         o_role = "user" if rec.role == "user" else "assistant"
         messages.append({"role": o_role, "content": rec.message})
-    
+
     messages.append({"role": "user", "content": user_msg})
 
-    # Step 1: Panggil LLM (Lokal atau Cloud)
-    print(f"\n{'=' * 78}\n[BENCHMARK] preset={model_label} | history={len(messages) - 2} pesan\n[BENCHMARK] prompt: {user_msg!r}")
-    t_start = time.perf_counter()
-    ai_resp, err_msg = query_llm(model_mode, messages, TOOLS_SCHEMA)
+    # Step 0: Ambil daftar tool DARI server MCP via tools/list, lalu terjemahkan
+    # ke format function-calling LLM. Inilah inti arsitektur MCP: server adalah
+    # sumber kebenaran tool, bukan konstanta di backend.
+    try:
+        mcp_tools = await mcp_client.list_tools()
+        tools_schema = mcp_tools_to_llm_schema(mcp_tools)
+    except Exception as e:
+        # Server MCP mati/putus: jangan crash. LLM tetap bisa menjawab percakapan
+        # umum tanpa tool, dan error-nya transparan di log.
+        print(f"[MCP] Gagal mengambil daftar tool dari server MCP: {type(e).__name__}: {e}")
+        tools_schema = []
+
+    # Step 1: Panggil LLM RONDE 1 = tahap KEPUTUSAN.
+    # LLM melihat pesan + daftar tool, lalu memutuskan: jawab langsung, atau
+    # panggil tool tertentu dengan argumen apa.
+    print(f"\n{'=' * 78}\n[BENCHMARK] preset={model_label} | history={len(messages) - 2} pesan | tools={len(tools_schema)}\n[BENCHMARK] prompt: {user_msg!r}")
+    t_start = time.perf_counter()  # mulai hitung waktu untuk log BENCHMARK
+    ai_resp, err_msg = query_llm(model_mode, messages, tools_schema)
     t_decide = time.perf_counter() - t_start
 
+    # Kalau LLM gagal dihubungi (timeout, API key salah, dll), hentikan di sini.
     if err_msg:
         print(f"[BENCHMARK] GAGAL setelah {t_decide:.1f}s: {err_msg.splitlines()[0]}")
         save_chat_message(db, user_id, "ai", err_msg)
         return ChatResponse(response=err_msg, model_used=model_label)
 
+    # tool_calls = daftar tool yang diminta LLM. Kosong = LLM mau jawab langsung.
     tool_calls = ai_resp.get("tool_calls", [])
     print(f"[BENCHMARK] keputusan dalam {t_decide:.1f}s | jumlah tool_calls={len(tool_calls)}")
     if not tool_calls:
         print("[BENCHMARK] tool dipilih: (tidak ada, dijawab langsung)")
 
-    # Step 2: Jika AI memutuskan untuk memanggil MCP Tool
+    # Step 2: LLM memutuskan memanggil tool -> jalankan tool-nya lewat MCP.
     if tool_calls:
         tool_outputs = []
 
+        # LLM bisa meminta lebih dari satu tool; proses satu per satu.
         for idx, tool_call in enumerate(tool_calls, start=1):
-            fn_name = tool_call.get("function", {}).get("name")
-            fn_args = tool_call.get("function", {}).get("arguments", {})
+            fn_name = tool_call.get("function", {}).get("name")       # nama tool, mis. "get_transactions"
+            fn_args = tool_call.get("function", {}).get("arguments", {})  # argumen pilihan LLM
 
             # RAW ARGS = output murni model sebelum ditambal sanitize_tool_args.
             # Inilah data yang dipakai untuk menilai kecerdasan model apa adanya.
             print(f"[BENCHMARK]   tool #{idx}: {fn_name}")
             print(f"[BENCHMARK]     RAW dari model : {json.dumps(fn_args, ensure_ascii=False, default=str)}")
 
+            # Perbaiki & lengkapi argumen: suntik user_id, koreksi tanggal/jenis
+            # yang sering salah pada model kecil. (lihat fungsi sanitize_tool_args)
             sanitized_args = sanitize_tool_args(fn_name, fn_args, user_id, user_msg)
             print(f"[BENCHMARK]     setelah sanitize: {json.dumps(sanitized_args, ensure_ascii=False, default=str)}")
 
-            mcp_result = call_mcp_tool(fn_name, sanitized_args)
+            # Eksekusi tool di server MCP lewat protokol MCP (tools/call), bukan REST.
+            # Di dalam sinilah query/update ke database PostgreSQL terjadi.
+            try:
+                mcp_result = await mcp_client.call_tool(fn_name, sanitized_args)
+            except Exception as e:
+                # Server MCP mati/putus: beri pesan, jangan sampai request crash.
+                print(f"[MCP] Gagal memanggil tool '{fn_name}': {type(e).__name__}: {e}")
+                mcp_result = f"Gagal terhubung ke MCP Server saat memanggil '{fn_name}': {e}"
             print(f"[BENCHMARK]     hasil MCP      : {str(mcp_result)[:160]}")
             tool_outputs.append(str(mcp_result or "Operasi MCP selesai."))
 
@@ -1011,7 +1041,10 @@ async def chat_with_ai(
             print(f"[BENCHMARK]   PERHATIAN: {len(tool_outputs)} tool dieksekusi, "
                   f"tapi hanya hasil tool #1 yang dikirim ke tahap sintesis.")
 
-        # Step 3: Sintesis respon akhir yang ramah & manusiawi berdasarkan hasil MCP Tool
+        # Step 3: Panggil LLM RONDE 2 = tahap SINTESIS.
+        # Hasil mentah dari tool (mis. "Ditemukan 2 pemasukan...") diubah jadi
+        # kalimat yang ramah dan enak dibaca. Catatan: hanya hasil tool PERTAMA
+        # (tool_outputs[0]) yang dikirim ke tahap ini.
         synthesis_messages = [
             {
                 "role": "system", 
@@ -1023,23 +1056,26 @@ async def chat_with_ai(
             }
         ]
 
+        # Ronde 2 tidak diberi daftar tool, jadi LLM murni merangkai kalimat.
         synth_resp, _ = query_llm(model_mode, synthesis_messages)
         print(f"[BENCHMARK] total waktu {time.perf_counter() - t_start:.1f}s (keputusan + eksekusi + sintesis)\n{'=' * 78}")
         if synth_resp and synth_resp.get("content"):
             final_ai_msg = synth_resp["content"]
-            save_chat_message(db, user_id, "ai", final_ai_msg)
-            return ChatResponse(response=final_ai_msg, model_used=model_label)
+            save_chat_message(db, user_id, "ai", final_ai_msg)  # simpan jawaban ke riwayat
+            return ChatResponse(response=final_ai_msg, model_used=model_label)  # <-- balik ke frontend
 
+        # Cadangan: kalau sintesis gagal, tampilkan saja hasil mentah tool apa adanya.
         fallback_ai_msg = f"🤖 **FinTracks AI Assistant:**\n\n" + "\n\n".join(tool_outputs)
         save_chat_message(db, user_id, "ai", fallback_ai_msg)
         return ChatResponse(response=fallback_ai_msg, model_used=model_label)
 
-    # Step 4: Jika AI tidak memerlukan tool (percakapan umum)
+    # Step 4: LLM tidak butuh tool (sapaan / pertanyaan umum) -> pakai jawaban ronde 1.
     direct_response = ai_resp.get("content", "")
     if direct_response:
         save_chat_message(db, user_id, "ai", direct_response)
         return ChatResponse(response=direct_response, model_used=model_label)
 
+    # Pengaman terakhir: LLM tidak memanggil tool DAN tidak memberi teks apa pun.
     empty_ai_msg = "🤖 **FinTracks AI Assistant:** Maaf, saya tidak dapat memahami permintaan Anda."
     save_chat_message(db, user_id, "ai", empty_ai_msg)
     return ChatResponse(response=empty_ai_msg, model_used=model_label)

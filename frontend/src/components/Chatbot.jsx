@@ -153,22 +153,26 @@ const Chatbot = () => {
         localStorage.setItem('fintracks_model_mode', newMode);
     };
 
+    // Dipanggil saat pengguna menekan "Kirim" atau Enter. Ini TITIK AWAL alur chat.
     const handleSend = async (e) => {
-        e.preventDefault();
-        if (!input.trim()) return;
+        e.preventDefault();           // cegah form me-reload halaman
+        if (!input.trim()) return;    // abaikan kalau input kosong / hanya spasi
 
         // Pesan baru belum punya created_at dari database, jadi dicap jam lokal.
         // Setelah halaman dimuat ulang, jam diambil dari riwayat di backend.
         const userMessage = { role: 'user', text: input, created_at: new Date().toISOString() };
-        setMessages(prev => [...prev, userMessage]);
-        setInput('');
-        setIsLoading(true);
+        setMessages(prev => [...prev, userMessage]);  // tampilkan pesan user langsung (optimistic)
+        setInput('');                 // kosongkan kolom input
+        setIsLoading(true);           // tampilkan indikator "sedang berpikir..."
 
         try {
+            // Kirim ke backend. api = axios yang otomatis menempel token JWT.
+            // Jawaban baru datang setelah backend selesai: LLM -> MCP -> LLM.
             const response = await api.post('/chat/', {
                 message: input,
-                model: selectedModel
+                model: selectedModel  // preset model yang dipilih di dropdown
             });
+            // Tambahkan balasan AI ke daftar pesan supaya muncul di layar.
             setMessages(prev => [...prev, { role: 'ai', text: response.data.response, created_at: new Date().toISOString() }]);
         } catch (error) {
             // Pesan seragam "gagal menghubungi AI" menyembunyikan penyebab sebenarnya.
