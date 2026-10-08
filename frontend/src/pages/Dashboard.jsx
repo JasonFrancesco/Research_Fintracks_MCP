@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useContext } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { AuthContext } from '../context/AuthContext';
 import api from '../services/api';
 import StatCard from '../components/StatCard';
@@ -7,6 +8,7 @@ import TransactionTable from '../components/TransactionTable';
 import { categoriesFor, isCategoryAllowed, defaultCategoryFor } from '../constants/categories';
 
 const Dashboard = () => {
+    const navigate = useNavigate();
     const { logout } = useContext(AuthContext);
     const [transactions, setTransactions] = useState([]);
     const [stats, setStats] = useState({ balance: 0, income: 0, expense: 0 });
@@ -148,7 +150,20 @@ const Dashboard = () => {
                 {/* Header */}
                 <div className="flex justify-between items-center mb-8">
                     <h1 className="text-3xl font-bold text-gray-800">Financial Dashboard</h1>
-                    <div className="flex gap-3">
+                    <div className="flex gap-3 items-center">
+                        <button
+                            onClick={() => navigate('/gatling')}
+                            className="bg-gradient-to-r from-orange-500 to-amber-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:from-orange-600 hover:to-amber-700 transition-all shadow-sm flex items-center gap-2"
+                        >
+                            <span>⚡</span> Gatling Studio
+                        </button>
+                        <button
+                            onClick={() => navigate('/gatling/copilot')}
+                            className="bg-slate-900 hover:bg-slate-800 text-orange-400 border border-slate-700 px-3.5 py-2 rounded-lg text-sm font-semibold transition-all shadow-sm flex items-center gap-1.5"
+                            title="Buka FinTracks Gatling AI Copilot"
+                        >
+                            <span>🤖</span> AI Copilot
+                        </button>
                         <button
                             onClick={() => setIsModalOpen(true)}
                             className="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors"

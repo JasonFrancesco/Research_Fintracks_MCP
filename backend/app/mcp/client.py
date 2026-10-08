@@ -33,19 +33,14 @@ def _mcp_url() -> str:
 
 
 @asynccontextmanager
-async def _session():
-    """Membuka session MCP yang sudah ter-initialize, lalu menutupnya rapi."""
+async def _session(timeout: float = 120.0):
+    """Membuka session MCP yang sudah ter-initialize dengan timeout memadai untuk durasi uji beban riil."""
     url = _mcp_url()
-    # streamablehttp_client membuka koneksi HTTP ke server MCP dan memberi kita
-    # dua "pipa": read_stream (baca balasan server) & write_stream (kirim ke server).
-    async with streamablehttp_client(url) as (read_stream, write_stream, _):
-        # ClientSession membungkus kedua pipa itu jadi API MCP yang rapi
-        # (punya .initialize(), .list_tools(), .call_tool(), dst).
+    # streamablehttp_client membuka koneksi HTTP ke server MCP dengan timeout 120s
+    async with streamablehttp_client(url, timeout=timeout, sse_read_timeout=300) as (read_stream, write_stream, _):
         async with ClientSession(read_stream, write_stream) as session:
-            # initialize() = handshake wajib MCP. Harus dipanggil sebelum
-            # tools/list atau tools/call, kalau tidak server menolak.
             await session.initialize()
-            yield session  # serahkan session ke pemanggil; koneksi ditutup otomatis setelah blok selesai
+            yield session
 
 
 async def list_tools() -> List[Dict[str, Any]]:
