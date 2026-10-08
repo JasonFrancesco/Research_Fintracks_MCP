@@ -20,13 +20,6 @@ from tools.transaction_tools import (
     delete_transaction_tool,
     get_summary_tool
 )
-from tools.gatling_tools import (
-    generate_gatling_script_tool,
-    trigger_gatling_test_tool,
-    get_gatling_history_tool,
-    get_gatling_report_tool,
-    get_rabbitmq_queue_status_tool
-)
 
 # Port & path endpoint MCP HTTP streamable. Backend terhubung ke
 # http://127.0.0.1:8001/mcp sebagai MCP client (protokol MCP, bukan REST).
@@ -145,84 +138,6 @@ def delete_transaction(transaction_id: int, user_id: int) -> str:
 def get_summary(user_id: int) -> str:
     """Mendapatkan ringkasan keuangan (Total Pemasukan, Total Pengeluaran, dan Saldo)."""
     return get_summary_tool(user_id)
-
-
-# --- Gatling & RabbitMQ Load Testing Tools ---
-@mcp.tool()
-def generate_gatling_script(
-    simulation_name: str,
-    target_queue: str,
-    virtual_users: int = 100,
-    duration_seconds: int = 30,
-    message_payload: Optional[str] = None,
-    login_username: Optional[str] = None,
-    login_password: Optional[str] = None,
-    login_captcha: Optional[str] = None
-) -> str:
-    """
-    Menghasilkan skrip simulasi Gatling (Scala DSL) untuk pengujian beban endpoint HTTP/HTTPS,
-    skenario login terotentikasi (IdentityServer3 OIDC ASP.NET), atau antrean RabbitMQ.
-    """
-    return generate_gatling_script_tool(
-        simulation_name=simulation_name,
-        target_queue=target_queue,
-        virtual_users=virtual_users,
-        duration_seconds=duration_seconds,
-        message_payload=message_payload,
-        login_username=login_username,
-        login_password=login_password,
-        login_captcha=login_captcha
-    )
-
-@mcp.tool()
-def trigger_gatling_test(
-    user_id: int,
-    simulation_name: str,
-    target_queue: str,
-    virtual_users: int = 100,
-    duration_seconds: int = 30,
-    scenario_description: Optional[str] = None,
-    login_username: Optional[str] = None,
-    login_password: Optional[str] = None,
-    login_captcha: Optional[str] = None
-) -> str:
-    """
-    Memicu dan mengeksekusi simulasi Gatling load test ke endpoint HTTP/HTTPS (termasuk login OIDC) atau antrean RabbitMQ,
-    serta mencatat metrik hasil pengujian (throughput, latency p95/p99, error rate) ke database.
-    """
-    return trigger_gatling_test_tool(
-        user_id=user_id,
-        simulation_name=simulation_name,
-        target_queue=target_queue,
-        virtual_users=virtual_users,
-        duration_seconds=duration_seconds,
-        scenario_description=scenario_description,
-        login_username=login_username,
-        login_password=login_password,
-        login_captcha=login_captcha
-    )
-
-@mcp.tool()
-def get_gatling_history(user_id: int, limit: int = 10) -> str:
-    """
-    Mengambil riwayat eksekusi pengujian beban Gatling pengguna yang tersimpan di database.
-    """
-    return get_gatling_history_tool(user_id=user_id, limit=limit)
-
-@mcp.tool()
-def get_gatling_report(test_id: int, user_id: int) -> str:
-    """
-    Mengambil detail laporan performa dan statistik lengkap untuk test ID tertentu.
-    """
-    return get_gatling_report_tool(test_id=test_id, user_id=user_id)
-
-@mcp.tool()
-def get_rabbitmq_queue_status(queue_name: Optional[str] = None) -> str:
-    """
-    Memeriksa status antrean pesan RabbitMQ (jumlah pesan siap, unacknowledged, consumers).
-    """
-    return get_rabbitmq_queue_status_tool(queue_name=queue_name)
-
 
 
 # Aplikasi ASGI MCP HTTP streamable. Di-expose di level modul agar bisa

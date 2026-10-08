@@ -76,26 +76,6 @@ def get_cloud_timeout() -> float:
         print(f"[Config] CLOUD_TIMEOUT='{raw}' bukan angka. Memakai 60.")
         return 60.0
 
-
-def get_cloud_output_params() -> tuple[float, Optional[int]]:
-    from dotenv import load_dotenv
-    load_dotenv(override=True)
-
-    raw_temp = (os.getenv("CLOUD_TEMPERATURE") or "").strip()
-    try:
-        temp = float(raw_temp) if raw_temp else 0.2
-    except ValueError:
-        print(f"[Config] CLOUD_TEMPERATURE='{raw_temp}' bukan angka. Memakai 0.2.")
-        temp = 0.2
-
-    raw_max_tokens = (os.getenv("CLOUD_MAX_TOKENS") or "").strip()
-    try:
-        max_tokens = int(raw_max_tokens) if raw_max_tokens else None
-    except ValueError:
-        print(f"[Config] CLOUD_MAX_TOKENS='{raw_max_tokens}' bukan integer.")
-        max_tokens = None
-    return temp, max_tokens
-
 # ---------------------------------------------------------------------------
 # Registry Provider Cloud (semuanya memakai format OpenAI Chat Completions)
 # ---------------------------------------------------------------------------
@@ -128,7 +108,7 @@ CLOUD_PROVIDERS: Dict[str, Dict[str, Any]] = {
         "label": "Google Gemini",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
         "key_envs": ["GEMINI_API_KEY", "CLOUD_API_KEY"],
-        "default_model": "gemini-3.1-flash",
+        "default_model": "gemini-2.0-flash",
         "key_page": "https://aistudio.google.com/apikey",
         "supports_tools": True,
     },
@@ -167,29 +147,17 @@ CHAT_PRESETS: Dict[str, Dict[str, Any]] = {
         "model_env": "PRESET_GPT_MODEL",
         "description": "Cepat dan paling andal untuk MCP tool calling.",
     },
-    "gemini": {
-        "label": "✨ Gemini 3.1 Flash (Google)",
+    "gemma": {
+        "label": "💠 Gemma 4 31B (Ollama Cloud)",
         "mode": "cloud",
-        "provider": "gemini",
-        "model": "gemini-3.1-flash",
-        "model_env": "PRESET_GEMINI_MODEL",
-        "description": "Model Google Gemini 3.1 Flash cerdas & cepat.",
+        "provider": "ollama_cloud",
+        "model": "gemma4:31b",
+        "model_env": "PRESET_GEMMA_MODEL",
+        "description": "Model Gemma 4 yang di-host Ollama Cloud.",
     },
 }
 
-def get_default_preset() -> str:
-    from dotenv import load_dotenv
-    load_dotenv(override=True)
-    env_default = (os.getenv("DEFAULT_CHAT_PRESET") or "").strip().lower()
-    if env_default and env_default in CHAT_PRESETS:
-        return env_default
-    if os.getenv("GEMINI_API_KEY"):
-        return "gemini"
-    if os.getenv("GROQ_API_KEY"):
-        return "gpt"
-    return "gemini"
-
-DEFAULT_PRESET = get_default_preset()
+DEFAULT_PRESET = "local"
 
 
 def resolve_preset(preset_id: Optional[str]) -> Dict[str, Any]:
@@ -200,8 +168,7 @@ def resolve_preset(preset_id: Optional[str]) -> Dict[str, Any]:
     from dotenv import load_dotenv
     load_dotenv(override=True)
 
-    default_p = get_default_preset()
-    pid = (preset_id or default_p).strip().lower()
+    pid = (preset_id or DEFAULT_PRESET).strip().lower()
 
     if pid == "cloud":
         # Mode legacy: seluruh konfigurasi diambil dari .env
@@ -220,10 +187,7 @@ def resolve_preset(preset_id: Optional[str]) -> Dict[str, Any]:
         pid = DEFAULT_PRESET
 
     spec = CHAT_PRESETS[pid]
-    env_model = (os.getenv(spec["model_env"]) or "").strip()
-    if not env_model and os.getenv("CLOUD_PROVIDER", "").strip().lower() == spec.get("provider"):
-        env_model = (os.getenv("CLOUD_MODEL") or "").strip()
-    model = env_model or spec["model"]
+    model = (os.getenv(spec["model_env"]) or "").strip() or spec["model"]
 
     if spec["mode"] == "local":
         model = get_active_model()
@@ -298,23 +262,6 @@ def resolve_cloud_config(
         model = model_override
     else:
         model = (os.getenv("CLOUD_MODEL") or "").strip() or spec["default_model"]
-
-    # Normalisasi alias model Gemini agar selalu memakai identifier resmi Google AI Studio
-    if provider == "gemini":
-        gemini_aliases = {
-            "gemini-3.1": "gemini-3.5-flash-lite",
-            "gemini-3.1-flash": "gemini-3.5-flash-lite",
-            "gemini-3.1-flash-preview": "gemini-3.5-flash-lite",
-            "gemini-3": "gemini-3-flash-preview",
-            "gemini-3-flash": "gemini-3-flash-preview",
-            "gemini-flash": "gemini-flash-lite-latest",
-            "gemini-2.0-flash": "gemini-flash-lite-latest",
-            "gemini-2.5-flash": "gemini-3.5-flash-lite",
-            "gemini-1.5-flash": "gemini-flash-lite-latest",
-        }
-        cleaned_m = model.strip().lower()
-        if cleaned_m in gemini_aliases:
-            model = gemini_aliases[cleaned_m]
 
     return {
         "provider": provider,
@@ -412,7 +359,7 @@ async def get_available_models():
             item["hint"] = None
         options.append(item)
 
-    return {"default": get_default_preset(), "models": options}
+    return {"default": DEFAULT_PRESET, "models": options}
 
 
 @router.get("/diagnose")
@@ -549,14 +496,11 @@ def query_llm(preset_id: str, messages: list, tools: list = None) -> tuple[Optio
             headers["HTTP-Referer"] = "http://localhost:3000"
             headers["X-Title"] = "FinTracks MCP"
 
-        temp, max_tokens = get_cloud_output_params()
         payload: Dict[str, Any] = {
             "model": cloud_model,
             "messages": messages,
-            "temperature": temp,
+            "temperature": 0.2,
         }
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -583,15 +527,6 @@ def query_llm(preset_id: str, messages: list, tools: list = None) -> tuple[Optio
                     f"lalu simpan di `backend/.env` dan kirim ulang pesan (tidak perlu restart backend).\n"
                     f"Pastikan juga `CLOUD_PROVIDER` cocok dengan asal key Anda."
                 )
-
-            # Jika Gemini model 404 atau 503 overload, fallback otomatis ke gemini-flash-lite-latest
-            if res.status_code in (404, 503) and cfg["provider"] == "gemini" and cloud_model != "gemini-flash-lite-latest":
-                print(f"[Gemini Fallback] Model '{cloud_model}' error ({res.status_code}). Beralih otomatis ke 'gemini-flash-lite-latest'...")
-                fallback_payload = {**payload, "model": "gemini-flash-lite-latest"}
-                fallback_res = requests.post(url, headers=headers, json=fallback_payload, timeout=cloud_timeout)
-                if fallback_res.status_code == 200:
-                    res = fallback_res
-                    cloud_model = "gemini-flash-lite-latest"
 
             if res.status_code == 404:
                 return None, (
