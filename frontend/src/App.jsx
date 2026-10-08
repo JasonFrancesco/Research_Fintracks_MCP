@@ -4,6 +4,8 @@ import { AuthProvider, AuthContext } from './context/AuthContext';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import Dashboard from './pages/Dashboard';
+import GatlingDashboard from './pages/GatlingDashboard';
+import GatlingCopilot from './pages/GatlingCopilot';
 import Chatbot from './components/Chatbot';
 
 const ProtectedRoute = ({ children }) => {
@@ -49,6 +51,30 @@ const App = () => {
                         element={
                             <ProtectedRoute>
                                 <DashboardLayout />
+                            </ProtectedRoute>
+                        }
+                    />
+                    <Route
+                        path="/gatling"
+                        element={
+                            <ProtectedRoute>
+                                <GatlingDashboard />
+                            </ProtectedRoute>
+                        }
+                    />
+                    <Route
+                        path="/gatling/copilot"
+                        element={
+                            <ProtectedRoute>
+                                <GatlingCopilot />
+                            </ProtectedRoute>
+                        }
+                    />
+                    <Route
+                        path="/gatling/chat"
+                        element={
+                            <ProtectedRoute>
+                                <Navigate to="/gatling/copilot" replace />
                             </ProtectedRoute>
                         }
                     />

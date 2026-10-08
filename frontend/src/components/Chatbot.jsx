@@ -99,8 +99,7 @@ const Chatbot = () => {
     const [isFetchingHistory, setIsFetchingHistory] = useState(true);
     const [selectedModel, setSelectedModel] = useState(() => {
         const saved = localStorage.getItem('fintracks_model_mode');
-        // 'cloud' adalah nilai lama sebelum ada preset bernama
-        return !saved || saved === 'cloud' ? 'local' : saved;
+        return !saved || saved === 'cloud' || saved === 'local' ? 'gemini' : saved;
     });
     const [modelOptions, setModelOptions] = useState([]);
     const scrollRef = useRef(null);
@@ -127,12 +126,12 @@ const Chatbot = () => {
                 const options = Array.isArray(res.data?.models) ? res.data.models : [];
                 setModelOptions(options);
 
-                // Kalau preset tersimpan sudah tidak ada di backend, pakai default
+                // Default ke model online (gemini atau settingan backend)
                 const saved = localStorage.getItem('fintracks_model_mode');
-                if (options.length > 0 && !options.some((m) => m.id === saved)) {
-                    const fallback = res.data?.default || options[0].id;
-                    setSelectedModel(fallback);
-                    localStorage.setItem('fintracks_model_mode', fallback);
+                const defaultModel = res.data?.default || 'gemini';
+                if (!saved || saved === 'local' || !options.some((m) => m.id === saved)) {
+                    setSelectedModel(defaultModel);
+                    localStorage.setItem('fintracks_model_mode', defaultModel);
                 }
             } catch (error) {
                 console.error('Gagal memuat info model:', error);
