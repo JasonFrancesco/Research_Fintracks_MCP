@@ -327,86 +327,44 @@ def trigger_gatling_test_tool(
         # Validasi durasi pengujian (minimal 5 detik)
         effective_duration = max(5, int(duration_seconds))
         flow_desc = f" (Authenticated Login: {login_username})" if is_auth else ""
-        print(f"[Gatling Engine] Memulai eksekusi uji beban nyata: {simulation_name} -> {target_queue}{flow_desc} ({virtual_users} VUs selama {effective_duration}s)...")
+        print(f"[Gatling Engine] Memulai eksekusi uji beban NYATA (Gatling via scala-cli): {simulation_name} -> {target_queue}{flow_desc} ({virtual_users} VUs selama {effective_duration}s)...")
 
-        import urllib3
-        import time
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        # === EKSEKUSI GATLING NYATA ===
+        # Menjalankan mesin Gatling sungguhan lewat scala-cli, lalu membaca metrik
+        # dari stats.json asli. Menggantikan simulasi probe+random versi lama.
+        from tools.gatling_runner import run_gatling_simulation
 
-        # Eksekusi aktif berkelanjutan selama durasi_seconds penuh
-        # Melakukan live probe sampling setiap detik untuk mengukur latensi nyata dari server target
-        start_time = time.time()
-        end_time = start_time + effective_duration
-        sample_latencies = []
-        sample_status_codes = []
-        probe_count = 0
+        run_result = run_gatling_simulation(
+            simulation_name=simulation_name,
+            script=script,
+            duration_seconds=effective_duration,
+        )
 
-        while time.time() < end_time:
-            probe_start = time.time()
-            if is_auth:
-                # Live authenticated probe login
-                latency, status_code = probe_authenticated_login(
-                    target_queue,
-                    login_username,
-                    login_password,
-                    login_captcha or "abc"
-                )
-                sample_latencies.append(latency)
-                sample_status_codes.append(status_code)
-            elif is_http:
-                try:
-                    res = requests.get(target_queue, verify=False, timeout=2.0, allow_redirects=True)
-                    latency = round((time.time() - probe_start) * 1000, 2)
-                    sample_latencies.append(latency)
-                    sample_status_codes.append(res.status_code)
-                except Exception:
-                    latency = round((time.time() - probe_start) * 1000, 2)
-                    sample_latencies.append(max(latency, round(random.uniform(150, 400), 2)))
-                    sample_status_codes.append(500)
-            else:
-                sample_latencies.append(round(random.uniform(5.0, 35.0), 2))
-                sample_status_codes.append(200)
+        if not run_result.get("success"):
+            err = run_result.get("error", "Penyebab tidak diketahui")
+            tail = run_result.get("stdout_tail", "")
+            return (
+                f"❌ Gagal mengeksekusi Gatling secara nyata: {err}\n"
+                + (f"\nDetail:\n{tail}" if tail else "")
+            )
 
-            probe_count += 1
-            elapsed_now = round(time.time() - start_time, 1)
-            print(f"[Gatling Engine Running] {elapsed_now}s/{effective_duration}s | Probe #{probe_count} | Target: {target_queue} | Latency: {sample_latencies[-1]}ms")
+        m = run_result["metrics"]
+        gatling_report_dir = run_result.get("report_dir")
+        actual_duration = run_result.get("elapsed", effective_duration)
 
-            time_spent = time.time() - probe_start
-            remaining = end_time - time.time()
-            if remaining <= 0:
-                break
-            sleep_needed = max(0.05, min(1.0 - time_spent, remaining))
-            if sleep_needed > 0:
-                time.sleep(sleep_needed)
+        # Metrik NYATA dari stats.json Gatling
+        total_requests = m["total_requests"]
+        successful_requests = m["successful_requests"]
+        failed_requests = m["failed_requests"]
+        error_percentage = m["error_rate"]
+        mean_rt = m["mean_response_time"]
+        min_rt = m["min_response_time"]
+        max_rt = m["max_response_time"]
+        p95_rt = m["p95_response_time"]
+        p99_rt = m["p99_response_time"]
 
-        actual_duration = round(time.time() - start_time, 1)
-        print(f"[Gatling Engine Complete] Selesai dieksekusi selama {actual_duration} detik penuh.")
-
-        # Hitung metrik simulasi eksekusi pengujian berdasarkan durasi nyata
-        rate_per_sec = max(5, int(virtual_users * (0.8 if is_auth else 1.5)))
-        total_requests = int(rate_per_sec * effective_duration)
-
-        # Hitung statistik latensi dari sample nyata yang dikumpulkan selama durasi pengujian
-        if sample_latencies:
-            sorted_l = sorted(sample_latencies)
-            mean_rt = round(sum(sorted_l) / len(sorted_l), 2)
-            min_rt = round(sorted_l[0], 2)
-            max_rt = round(sorted_l[-1], 2)
-            p95_index = int(len(sorted_l) * 0.95)
-            p99_index = int(len(sorted_l) * 0.99)
-            p95_rt = round(sorted_l[min(p95_index, len(sorted_l) - 1)] * random.uniform(1.0, 1.15), 2)
-            p99_rt = round(max(p95_rt, sorted_l[min(p99_index, len(sorted_l) - 1)] * random.uniform(1.05, 1.25)), 2)
-        else:
-            mean_rt = round(random.uniform(35.0, 75.0), 2)
-            min_rt = round(mean_rt * 0.45, 2)
-            max_rt = round(mean_rt * 2.8, 2)
-            p95_rt = round(mean_rt * 1.8, 2)
-            p99_rt = round(p95_rt * 1.3, 2)
-
-        failed_probes = sum(1 for c in sample_status_codes if c >= 400)
-        error_percentage = round((failed_probes / max(1, len(sample_status_codes))) * 100, 2) if sample_status_codes else round(random.uniform(0.05, 0.5), 2)
-        failed_requests = int(total_requests * (error_percentage / 100.0))
-        successful_requests = total_requests - failed_requests
+        print(f"[Gatling Engine Complete] Gatling selesai dalam {actual_duration}s. "
+              f"Total request NYATA: {total_requests} (OK={successful_requests}, KO={failed_requests}).")
 
         target_type_str = "HTTP/HTTPS (Authenticated Login Flow)" if is_auth else ("HTTP/HTTPS Endpoint" if is_http else "RabbitMQ Queue")
 
@@ -417,7 +375,8 @@ def trigger_gatling_test_tool(
             "authenticated_user": login_username if is_auth else None,
             "virtual_users": virtual_users,
             "duration": f"{effective_duration}s",
-            "throughput_rps": round(total_requests / max(1, effective_duration), 1),
+            "throughput_rps": m["throughput_rps"],
+            "gatling_report_dir": gatling_report_dir,
             "stats": {
                 "total": total_requests,
                 "ok": successful_requests,
@@ -626,3 +585,301 @@ def get_rabbitmq_queue_status_tool(queue_name: Optional[str] = None) -> str:
         f"• Port Management: 15672 (Opsional untuk web UI RabbitMQ)\n"
         f"• Kesiapan Pengujian Gatling: Siap diuji dengan simulasi load test."
     )
+
+
+# ===========================================================================
+# TAHAP 3: Jalur ASYNC via RabbitMQ (enqueue -> worker -> execute)
+# ===========================================================================
+
+def enqueue_gatling_test_tool(
+    user_id: int,
+    simulation_name: str,
+    target_queue: str,
+    virtual_users: int = 100,
+    duration_seconds: int = 30,
+    scenario_description: Optional[str] = None,
+    login_username: Optional[str] = None,
+    login_password: Optional[str] = None,
+    login_captcha: Optional[str] = None,
+) -> str:
+    """
+    Menitipkan job stress test Gatling ke antrian RabbitMQ (asinkron).
+
+    Berbeda dari trigger_gatling_test (yang menjalankan Gatling langsung dan
+    menunggu selesai), tool ini LANGSUNG kembali dengan nomor job setelah job
+    masuk antrian. Worker terpisah yang mengeksekusi Gatling di latar belakang.
+    Cocok untuk tes panjang agar chatbot tidak menggantung menunggu.
+    """
+    db = get_db_session()
+    try:
+        # GUARD MAKS 3 JOB AKTIF (opsi A): tolak job baru bila sudah ada 3 job
+        # milik user yang BENAR-BENAR aktif. Batas via env GATLING_MAX_CONCURRENT.
+        #
+        # Hanya hitung job yang masih "segar". Job queued/running yang umurnya
+        # sudah lewat batas wajar dianggap STALE (worker mati, pesan hilang, atau
+        # gagal update status) dan tidak dihitung, supaya slot tidak terkunci
+        # selamanya oleh job hantu. Sistem pulih sendiri tanpa reset manual.
+        max_concurrent = int(os.getenv("GATLING_MAX_CONCURRENT", "3"))
+        stale_minutes = int(os.getenv("GATLING_STALE_MINUTES", "15"))
+        stale_cutoff = datetime.now() - timedelta(minutes=stale_minutes)
+
+        active = (
+            db.query(GatlingTestRun)
+            .filter(
+                GatlingTestRun.user_id == int(user_id),
+                GatlingTestRun.status.in_(["queued", "running"]),
+                GatlingTestRun.created_at >= stale_cutoff,
+            )
+            .count()
+        )
+        if active >= max_concurrent:
+            return (
+                f"⚠️ Batas pengujian paralel tercapai ({active}/{max_concurrent} job sedang berjalan). "
+                f"Mohon tunggu salah satu pengujian selesai sebelum menjalankan yang baru. "
+                f"Laporan setiap job akan muncul otomatis di chat begitu selesai."
+            )
+
+        effective_duration = max(5, int(duration_seconds))
+
+        # Buat record berstatus 'queued' lebih dulu agar punya nomor job (ID)
+        # yang bisa langsung diberikan ke pengguna untuk dilacak.
+        test_run = GatlingTestRun(
+            user_id=int(user_id),
+            simulation_name=simulation_name,
+            scenario_description=scenario_description or f"Uji beban antrean {virtual_users} VUs ke {target_queue}",
+            target_queue=target_queue,
+            virtual_users=int(virtual_users),
+            duration_seconds=int(effective_duration),
+            status="queued",
+        )
+        db.add(test_run)
+        db.commit()
+        db.refresh(test_run)
+        job_id = test_run.id
+
+        # Publish job ke RabbitMQ. Worker akan membaca field-field ini.
+        from tools.rabbitmq_publisher import publish_job, queue_name
+        job = {
+            "job_id": job_id,
+            "user_id": int(user_id),
+            "simulation_name": simulation_name,
+            "target_queue": target_queue,
+            "virtual_users": int(virtual_users),
+            "duration_seconds": int(effective_duration),
+            "scenario_description": scenario_description,
+            "login_username": login_username,
+            "login_password": login_password,
+            "login_captcha": login_captcha,
+        }
+        try:
+            publish_job(job)
+        except Exception as pub_err:
+            # Gagal publish: tandai job gagal supaya tidak menggantung 'queued' selamanya.
+            test_run.status = "failed"
+            test_run.scenario_description = f"Gagal masuk antrian RabbitMQ: {pub_err}"
+            db.commit()
+            return (
+                f"❌ Gagal menitipkan job ke RabbitMQ: {pub_err}\n"
+                f"Pastikan RabbitMQ berjalan di {os.getenv('RABBITMQ_HOST','localhost')}:{os.getenv('RABBITMQ_PORT','5672')}."
+            )
+
+        return (
+            f"📥 **Job Stress Test Berhasil Masuk Antrian (Job #{job_id})**\n"
+            f"• Simulasi: {simulation_name}\n"
+            f"• Target: `{target_queue}`\n"
+            f"• Beban: {virtual_users} VUs selama {effective_duration} detik\n"
+            f"• Antrian: `{queue_name()}` (RabbitMQ)\n"
+            f"• Status: QUEUED — worker akan segera mengeksekusi Gatling di latar belakang.\n"
+            f"• Lacak hasil dengan get_gatling_report (test_id={job_id}) setelah beberapa saat."
+        )
+    except Exception as e:
+        db.rollback()
+        return f"Gagal menitipkan job Gatling ke antrian: {str(e)}"
+    finally:
+        db.close()
+
+
+def run_queued_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Dieksekusi oleh WORKER untuk satu job yang diambil dari RabbitMQ.
+
+    Alur: tandai record 'running' -> jalankan Gatling NYATA (gatling_runner) ->
+    simpan metrik asli + generate report HTML -> tandai 'completed' / 'failed'.
+    Return dict ringkas untuk logging worker.
+    """
+    import os as _os
+    db = get_db_session()
+    try:
+        job_id = int(job["job_id"])
+        run = db.query(GatlingTestRun).filter(GatlingTestRun.id == job_id).first()
+        if not run:
+            return {"ok": False, "error": f"Job #{job_id} tidak ditemukan di database."}
+
+        # Job bisa dibatalkan user (reset-queue) setelah masuk antrian RabbitMQ.
+        # Lewati tanpa menjalankan Gatling. Pesan tetap di-ack supaya hilang dari antrian.
+        if run.status == "cancelled":
+            return {"ok": True, "job_id": job_id, "skipped": "cancelled"}
+
+        run.status = "running"
+        db.commit()
+
+        target = job["target_queue"]
+        is_http = target.startswith("http://") or target.startswith("https://")
+
+        # Buat script Gatling (pakai generator yang sama dengan jalur langsung)
+        script = generate_gatling_script_tool(
+            simulation_name=job["simulation_name"],
+            target_queue=target,
+            virtual_users=job["virtual_users"],
+            duration_seconds=job["duration_seconds"],
+            login_username=job.get("login_username"),
+            login_password=job.get("login_password"),
+            login_captcha=job.get("login_captcha"),
+        )
+
+        # Jalankan Gatling NYATA
+        from tools.gatling_runner import run_gatling_simulation
+        res = run_gatling_simulation(
+            simulation_name=job["simulation_name"],
+            script=script,
+            duration_seconds=job["duration_seconds"],
+        )
+
+        if not res.get("success"):
+            run.status = "failed"
+            run.scenario_description = f"Eksekusi Gatling gagal: {res.get('error')}"
+            run.generated_script = script
+            db.commit()
+            return {"ok": False, "job_id": job_id, "error": res.get("error")}
+
+        m = res["metrics"]
+        is_auth = is_http and bool(job.get("login_username") and job.get("login_password"))
+        target_type_str = "HTTP/HTTPS (Authenticated Login Flow)" if is_auth else ("HTTP/HTTPS Endpoint" if is_http else "RabbitMQ Queue")
+
+        report_summary_data = {
+            "simulation": job["simulation_name"],
+            "target": target,
+            "target_type": target_type_str,
+            "virtual_users": job["virtual_users"],
+            "duration": f"{job['duration_seconds']}s",
+            "throughput_rps": m["throughput_rps"],
+            "gatling_report_dir": res.get("report_dir"),
+            "stats": {
+                "total": m["total_requests"],
+                "ok": m["successful_requests"],
+                "ko": m["failed_requests"],
+                "error_rate": f"{m['error_rate']}%",
+            },
+            "response_times_ms": {
+                "min": m["min_response_time"],
+                "mean": m["mean_response_time"],
+                "p95": m["p95_response_time"],
+                "p99": m["p99_response_time"],
+                "max": m["max_response_time"],
+            },
+        }
+
+        run.total_requests = m["total_requests"]
+        run.successful_requests = m["successful_requests"]
+        run.failed_requests = m["failed_requests"]
+        run.mean_response_time = m["mean_response_time"]
+        run.p95_response_time = m["p95_response_time"]
+        run.p99_response_time = m["p99_response_time"]
+        run.error_rate = m["error_rate"]
+        run.report_summary = json.dumps(report_summary_data, indent=2)
+        run.generated_script = script
+        run.status = "completed"
+        run.completed_at = datetime.now()
+        run.report_url = f"/gatling/report/{run.id}/html"
+        db.commit()
+        db.refresh(run)
+
+        # Generate report HTML (best effort, tidak menggagalkan job bila error)
+        try:
+            from app.services.gatling_report_generator import generate_gatling_html_report
+            reports_dir = _os.path.join(backend_dir, "reports")
+            _os.makedirs(reports_dir, exist_ok=True)
+            report_file_path = _os.path.join(reports_dir, f"gatling_report_{run.id}.html")
+            html_output = generate_gatling_html_report(
+                test_id=run.id, simulation_name=run.simulation_name, target=run.target_queue,
+                virtual_users=run.virtual_users, duration_seconds=run.duration_seconds,
+                total_requests=run.total_requests, successful_requests=run.successful_requests,
+                failed_requests=run.failed_requests, mean_rt=float(run.mean_response_time or 0),
+                p95_rt=float(run.p95_response_time or 0), p99_rt=float(run.p99_response_time or 0),
+                error_rate=float(run.error_rate or 0), report_summary=report_summary_data,
+                generated_script=run.generated_script, created_at=run.created_at,
+            )
+            with open(report_file_path, "w", encoding="utf-8") as f:
+                f.write(html_output)
+        except Exception as gen_err:
+            print(f"[Worker Report Gen Error] {gen_err}")
+
+        return {
+            "ok": True, "job_id": job_id,
+            "total": m["total_requests"], "ok_req": m["successful_requests"],
+            "ko_req": m["failed_requests"], "p95": m["p95_response_time"],
+        }
+    except Exception as e:
+        db.rollback()
+        return {"ok": False, "job_id": job.get("job_id"), "error": str(e)}
+    finally:
+        db.close()
+
+
+def get_queue_status_tool(user_id: int) -> str:
+    """
+    Status NYATA antrian job stress test milik user, dibaca dari database.
+    Mengembalikan jumlah per status + berapa slot paralel terpakai.
+    Dipakai saat user bertanya 'antrian berapa', 'status', 'ada berapa job', dll.
+    """
+    db = get_db_session()
+    try:
+        max_concurrent = int(os.getenv("GATLING_MAX_CONCURRENT", "3"))
+
+        def count(status):
+            return (
+                db.query(GatlingTestRun)
+                .filter(GatlingTestRun.user_id == int(user_id), GatlingTestRun.status == status)
+                .count()
+            )
+
+        queued = count("queued")
+        running = count("running")
+        completed = count("completed")
+        failed = count("failed")
+        active = queued + running
+
+        # Daftar singkat job yang masih aktif (queued/running) beserta nomornya
+        active_runs = (
+            db.query(GatlingTestRun)
+            .filter(
+                GatlingTestRun.user_id == int(user_id),
+                GatlingTestRun.status.in_(["queued", "running"]),
+            )
+            .order_by(GatlingTestRun.id.asc())
+            .all()
+        )
+        active_lines = [
+            f"  - Job #{r.id} ({r.status.upper()}): {r.simulation_name} -> {r.target_queue}"
+            for r in active_runs
+        ]
+
+        lines = [
+            "Status Antrian Pengujian Gatling Anda saat ini:",
+            f"• Sedang berjalan (running): {running}",
+            f"• Menunggu antrian (queued): {queued}",
+            f"• Slot paralel terpakai: {active}/{max_concurrent}",
+            f"• Total selesai (completed): {completed}",
+            f"• Total gagal (failed): {failed}",
+        ]
+        if active_lines:
+            lines.append("Job yang masih aktif:")
+            lines.extend(active_lines)
+        else:
+            lines.append("Tidak ada job yang sedang berjalan atau menunggu saat ini.")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Gagal membaca status antrian: {str(e)}"
+    finally:
+        db.close()

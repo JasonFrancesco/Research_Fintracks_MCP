@@ -1,3 +1,18 @@
+"""
+=============================================================================
+ PERAN MCP: SERVER (MCP Server / Tool Provider)
+=============================================================================
+File ini adalah MCP SERVER. Perannya dalam arsitektur Model Context Protocol:
+
+    [MCP HOST: backend] --> [MCP CLIENT] --> [MCP SERVER: file ini] --> tools
+
+- SERVER menyediakan TOOLS (lihat @mcp.tool() di bawah) dan mengeksekusinya.
+- SERVER tidak memegang LLM dan tidak mengambil keputusan; ia hanya menjawab
+  permintaan tools/list dan tools/call dari CLIENT.
+- Dibangun dengan FastMCP (SDK resmi MCP). Transport: HTTP streamable (/mcp)
+  untuk web app, atau stdio (--stdio) untuk Claude Desktop / Cursor.
+=============================================================================
+"""
 import os
 import sys
 import asyncio
@@ -23,9 +38,11 @@ from tools.transaction_tools import (
 from tools.gatling_tools import (
     generate_gatling_script_tool,
     trigger_gatling_test_tool,
+    enqueue_gatling_test_tool,
     get_gatling_history_tool,
     get_gatling_report_tool,
-    get_rabbitmq_queue_status_tool
+    get_rabbitmq_queue_status_tool,
+    get_queue_status_tool
 )
 
 # Port & path endpoint MCP HTTP streamable. Backend terhubung ke
@@ -34,7 +51,9 @@ MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1")
 MCP_PORT = int(os.getenv("MCP_PORT", "8001"))
 MCP_PATH = os.getenv("MCP_PATH", "/mcp")
 
-# Inisialisasi FastMCP Server dengan transport HTTP streamable.
+# ==== OBJEK MCP SERVER ====
+# 'mcp' adalah instance MCP SERVER. Semua @mcp.tool() di bawah adalah tool yang
+# DISEDIAKAN server ini untuk dipanggil oleh MCP CLIENT (di backend).
 # stateless_http=True: tiap request MCP berdiri sendiri tanpa sesi persisten,
 # cocok untuk backend yang connect-list-call-close per permintaan chat.
 mcp = FastMCP(
@@ -201,6 +220,48 @@ def trigger_gatling_test(
         login_password=login_password,
         login_captcha=login_captcha
     )
+
+@mcp.tool()
+def enqueue_gatling_test(
+    user_id: int,
+    simulation_name: str,
+    target_queue: str,
+    virtual_users: int = 100,
+    duration_seconds: int = 30,
+    scenario_description: Optional[str] = None,
+    login_username: Optional[str] = None,
+    login_password: Optional[str] = None,
+    login_captcha: Optional[str] = None
+) -> str:
+    """
+    Menitipkan job stress test Gatling ke antrian RabbitMQ (ASINKRON) dan langsung
+    mengembalikan nomor job tanpa menunggu eksekusi selesai. Worker Service terpisah
+    yang akan mengeksekusi Gatling di latar belakang. Gunakan untuk pengujian durasi
+    panjang agar tidak menunggu. Untuk eksekusi langsung yang menunggu hasil, pakai
+    trigger_gatling_test.
+    """
+    return enqueue_gatling_test_tool(
+        user_id=user_id,
+        simulation_name=simulation_name,
+        target_queue=target_queue,
+        virtual_users=virtual_users,
+        duration_seconds=duration_seconds,
+        scenario_description=scenario_description,
+        login_username=login_username,
+        login_password=login_password,
+        login_captcha=login_captcha
+    )
+
+@mcp.tool()
+def get_queue_status(user_id: int) -> str:
+    """
+    Memeriksa STATUS ANTRIAN job stress test milik pengguna saat ini (jumlah job
+    yang sedang berjalan/running, menunggu/queued, selesai, dan slot paralel terpakai).
+    Panggil tool INI ketika pengguna BERTANYA status seperti 'antrian berapa',
+    'ada berapa job', 'status pengujian', 'berapa yang sedang jalan'. JANGAN
+    menjalankan test baru untuk pertanyaan status seperti ini.
+    """
+    return get_queue_status_tool(user_id=user_id)
 
 @mcp.tool()
 def get_gatling_history(user_id: int, limit: int = 10) -> str:

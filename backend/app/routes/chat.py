@@ -32,9 +32,11 @@ class ChatMessageItem(BaseModel):
     text: str
     created_at: Optional[datetime] = None
 
-# Lapisan MCP client: backend bicara ke mcp-server lewat protokol MCP
-# (tools/list + tools/call), bukan REST. Menggantikan MCP_SERVER_URL + call_mcp_tool.
-from ..mcp import client as mcp_client
+# ==== PERAN MCP: HOST ====
+# chat.py berperan sebagai MCP HOST: ia yang memegang LLM dan mengambil keputusan.
+# Untuk bicara ke MCP SERVER, HOST memakai MCP CLIENT (modul di bawah), bukan REST.
+# Alur: HOST (file ini) -> mcp_client (CLIENT) -> MCP SERVER (mcp-server/server.py)
+from ..mcp import client as mcp_client   # CLIENT: juru bicara protokol MCP
 from ..mcp.schema_adapter import mcp_tools_to_llm_schema
 
 # Nilai awal sebagai cadangan. JANGAN dipakai langsung untuk request: konstanta

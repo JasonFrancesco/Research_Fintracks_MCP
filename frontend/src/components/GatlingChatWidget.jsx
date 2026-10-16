@@ -117,6 +117,33 @@ const GatlingChatWidget = ({ onTestTriggered }) => {
         }
     }, [messages, isChatLoading, isOpen]);
 
+    // POLLING: cek report job yang baru selesai tiap 3 detik, lalu munculkan
+    // sebagai bubble baru. Jalan terus (tidak bergantung isOpen) agar report tidak
+    // terlewat; pesan disimpan ke cache sehingga tetap ada saat widget dibuka.
+    useEffect(() => {
+        const interval = setInterval(async () => {
+            try {
+                const res = await api.get('/gatling/chat/updates');
+                const updates = Array.isArray(res.data) ? res.data : [];
+                if (updates.length > 0) {
+                    setMessages(prev => {
+                        const existingIds = new Set(prev.map(m => m.id).filter(Boolean));
+                        const fresh = updates
+                            .filter(u => !existingIds.has(u.id))
+                            .map(u => ({ id: u.id, role: 'ai', text: u.text, created_at: u.created_at, isReport: true }));
+                        if (fresh.length === 0) return prev;
+                        const next = [...prev, ...fresh];
+                        try { localStorage.setItem('fintracks_gatling_chat_cache', JSON.stringify(next)); } catch (e) {}
+                        return next;
+                    });
+                }
+            } catch (e) {
+                // diam saja; polling berikutnya coba lagi
+            }
+        }, 3000);
+        return () => clearInterval(interval);
+    }, []);
+
     // Send Message Handler
     const handleSendMessage = async (textToSend = null) => {
         const query = (textToSend || chatInput).trim();
@@ -226,9 +253,33 @@ const GatlingChatWidget = ({ onTestTriggered }) => {
                     </div>
                 );
             }
+            // Teks biasa: ubah URL (http/https) menjadi tautan yang bisa diklik,
+            // supaya link laporan Gatling langsung dapat dibuka tanpa copy-paste.
+            const segments = part.split(/(https?:\/\/[^\s]+)/g);
             return (
                 <span key={pIdx} className="whitespace-pre-wrap">
-                    {part}
+                    {segments.map((seg, sIdx) => {
+                        if (seg.startsWith('http://') || seg.startsWith('https://')) {
+                            // Buang tanda baca di ujung yang bukan bagian URL (mis. titik/koma).
+                            const match = seg.match(/^(.*?)([.,;:)]*)$/s);
+                            const cleanUrl = match ? match[1] : seg;
+                            const trailing = match ? match[2] : '';
+                            return (
+                                <React.Fragment key={sIdx}>
+                                    <a
+                                        href={cleanUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="text-orange-400 underline decoration-orange-400/50 hover:text-orange-300 hover:decoration-orange-300 break-all font-medium"
+                                    >
+                                        {cleanUrl}
+                                    </a>
+                                    {trailing}
+                                </React.Fragment>
+                            );
+                        }
+                        return <React.Fragment key={sIdx}>{seg}</React.Fragment>;
+                    })}
                 </span>
             );
         });
@@ -369,13 +420,15 @@ const GatlingChatWidget = ({ onTestTriggered }) => {
                                                 className={`p-3 rounded-2xl shadow-sm ${
                                                     isUser
                                                         ? 'bg-gradient-to-r from-orange-600 to-amber-600 text-white rounded-tr-none'
-                                                        : 'bg-slate-900 text-slate-200 border border-slate-800 rounded-tl-none font-sans text-xs leading-relaxed'
+                                                        : m.isReport
+                                                            ? 'bg-emerald-950/40 text-slate-100 border border-emerald-500/40 rounded-tl-none font-sans text-xs leading-relaxed'
+                                                            : 'bg-slate-900 text-slate-200 border border-slate-800 rounded-tl-none font-sans text-xs leading-relaxed'
                                                 }`}
                                             >
                                                 {renderFormattedMessage(m.text, i)}
                                             </div>
                                             <div className={`text-[9px] text-slate-500 px-1 flex items-center gap-1.5 ${isUser ? 'justify-end' : 'justify-start'}`}>
-                                                <span>{isUser ? 'Anda' : 'Copilot'}</span>
+                                                <span>{isUser ? 'Anda' : m.isReport ? '📊 Laporan Gatling' : 'Copilot'}</span>
                                                 {m.created_at && (
                                                     <span>• {formatChatTime(m.created_at)}</span>
                                                 )}

@@ -165,10 +165,40 @@ const GatlingCopilot = () => {
         chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [messages, isChatLoading]);
 
+    // POLLING: cek report job yang baru selesai tiap 3 detik, lalu munculkan
+    // sebagai bubble baru di chat secara otomatis (tanpa user refresh/tanya).
+    // Inilah mekanisme "report callback" untuk alur async non-blocking.
+    useEffect(() => {
+        const interval = setInterval(async () => {
+            try {
+                const res = await api.get('/gatling/chat/updates');
+                const updates = Array.isArray(res.data) ? res.data : [];
+                if (updates.length > 0) {
+                    setMessages(prev => {
+                        // Hindari duplikat: lewati pesan yang id-nya sudah ada.
+                        const existingIds = new Set(prev.map(m => m.id).filter(Boolean));
+                        const fresh = updates
+                            .filter(u => !existingIds.has(u.id))
+                            .map(u => ({ id: u.id, role: 'ai', text: u.text, created_at: u.created_at, isReport: true }));
+                        if (fresh.length === 0) return prev;
+                        const next = [...prev, ...fresh];
+                        try { localStorage.setItem('fintracks_gatling_chat_cache', JSON.stringify(next)); } catch (e) {}
+                        return next;
+                    });
+                }
+            } catch (e) {
+                // diam saja; polling berikutnya coba lagi
+            }
+        }, 3000);
+        return () => clearInterval(interval);
+    }, []);
+
     // Send Message Handler
     const handleSendMessage = async (textToSend = null) => {
         const query = (textToSend || chatInput).trim();
-        if (!query || isChatLoading) return;
+        // Hanya cegah kiriman kosong. Loading TIDAK lagi memblokir: user boleh
+        // kirim pesan lagi sambil balasan sebelumnya atau Gatling masih berjalan.
+        if (!query) return;
 
         const userMsg = { role: 'user', text: query, created_at: new Date().toISOString() };
         setMessages(prev => {
@@ -215,6 +245,26 @@ const GatlingCopilot = () => {
         } finally {
             if (chatTimerRef.current) clearInterval(chatTimerRef.current);
             setIsChatLoading(false);
+        }
+    };
+
+    // Reset antrian job yang belum jalan (status 'queued'), agar slot paralel
+    // terbuka untuk permintaan baru. Job yang sedang 'running' tidak dibatalkan.
+    const handleResetQueue = async () => {
+        try {
+            const res = await api.post('/gatling/reset-queue');
+            const info = res.data || {};
+            setMessages(prev => {
+                const next = [...prev, {
+                    role: 'ai',
+                    text: `♻️ ${info.message || 'Antrean pengujian direset.'}`,
+                    created_at: new Date().toISOString(),
+                }];
+                try { localStorage.setItem('fintracks_gatling_chat_cache', JSON.stringify(next)); } catch (e) {}
+                return next;
+            });
+        } catch (err) {
+            alert('Gagal mereset antrean pengujian.');
         }
     };
 
@@ -270,9 +320,31 @@ const GatlingCopilot = () => {
                     </div>
                 );
             }
+            // Ubah URL menjadi tautan yang bisa diklik.
+            const segments = part.split(/(https?:\/\/[^\s]+)/g);
             return (
                 <span key={pIdx} className="whitespace-pre-wrap">
-                    {part}
+                    {segments.map((seg, sIdx) => {
+                        if (seg.startsWith('http://') || seg.startsWith('https://')) {
+                            const m = seg.match(/^(.*?)([.,;:)]*)$/s);
+                            const cleanUrl = m ? m[1] : seg;
+                            const trailing = m ? m[2] : '';
+                            return (
+                                <React.Fragment key={sIdx}>
+                                    <a
+                                        href={cleanUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="text-orange-400 underline decoration-orange-400/50 hover:text-orange-300 break-all font-medium"
+                                    >
+                                        {cleanUrl}
+                                    </a>
+                                    {trailing}
+                                </React.Fragment>
+                            );
+                        }
+                        return <React.Fragment key={sIdx}>{seg}</React.Fragment>;
+                    })}
                 </span>
             );
         });
@@ -499,13 +571,24 @@ const GatlingCopilot = () => {
                         </div>
 
                         <div className="flex items-center gap-2">
-                            <button
+            <button
                                 onClick={fetchChatHistory}
                                 className="text-xs text-slate-400 hover:text-white bg-slate-800 px-2.5 py-1 rounded-lg transition"
                                 title="Muat ulang riwayat"
                             >
                                 ↻ Refresh
                             </button>
+            {/* Fitur Reset Antrean di-HOLD sementara. Backend /gatling/reset-queue
+                dan handler handleResetQueue tetap ada, tinggal aktifkan kembali tombol
+                ini saat dibutuhkan.
+                <button
+                    onClick={handleResetQueue}
+                    className="text-xs text-amber-400 hover:text-amber-300 bg-amber-500/10 border border-amber-500/30 px-2.5 py-1 rounded-lg transition"
+                    title="Batalkan antrean pengujian yang belum berjalan (status queued) agar bisa menjalankan perintah baru"
+                >
+                    ♻️ Reset Antrean
+                </button>
+            */}
                             {messages.length > 0 && (
                                 <button
                                     onClick={handleClearHistory}
@@ -577,13 +660,15 @@ const GatlingCopilot = () => {
                                                 className={`p-4 rounded-2xl shadow-md ${
                                                     isUser
                                                         ? 'bg-gradient-to-r from-orange-600 to-amber-600 text-white rounded-tr-none'
-                                                        : 'bg-slate-900 text-slate-200 border border-slate-800 rounded-tl-none font-sans text-xs leading-relaxed'
+                                                        : m.isReport
+                                                            ? 'bg-emerald-950/40 text-slate-100 border border-emerald-500/40 rounded-tl-none font-sans text-xs leading-relaxed'
+                                                            : 'bg-slate-900 text-slate-200 border border-slate-800 rounded-tl-none font-sans text-xs leading-relaxed'
                                                 }`}
                                             >
                                                 {renderFormattedMessage(m.text, i)}
                                             </div>
                                             <div className={`text-[10px] text-slate-500 px-1 flex items-center gap-2 ${isUser ? 'justify-end' : 'justify-start'}`}>
-                                                <span>{isUser ? 'Anda' : 'Gatling Copilot'}</span>
+                                                <span>{isUser ? 'Anda' : m.isReport ? '📊 Laporan Gatling' : 'Gatling Copilot'}</span>
                                                 {m.created_at && (
                                                     <span>• {new Date(m.created_at).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}</span>
                                                 )}
@@ -599,24 +684,18 @@ const GatlingCopilot = () => {
                             })
                         )}
 
-                        {/* Active Execution Banner with Live Timer */}
+                        {/* Indikator singkat: AI sedang menyusun balasan (bukan menunggu Gatling).
+                            Gatling berjalan di latar belakang; laporannya datang otomatis via polling. */}
                         {isChatLoading && (
                             <div className="flex gap-3">
                                 <div className="h-7 w-7 rounded-lg bg-orange-600/20 border border-orange-500/30 flex items-center justify-center text-xs shrink-0 mt-1">
                                     🤖
                                 </div>
-                                <div className="max-w-[80%] bg-slate-900 border border-orange-500/30 rounded-2xl rounded-tl-none p-4 shadow-xl space-y-2">
+                                <div className="max-w-[80%] bg-slate-900 border border-orange-500/30 rounded-2xl rounded-tl-none p-4 shadow-xl">
                                     <div className="flex items-center gap-2 text-orange-400 font-semibold text-xs">
                                         <span className="h-2 w-2 bg-orange-400 rounded-full animate-ping"></span>
-                                        <span>
-                                            {chatElapsedSeconds > 0
-                                                ? `Mesin Gatling sedang mengeksekusi pengujian (${chatElapsedSeconds} detik berjalan)...`
-                                                : 'AI sedang menginisialisasi skrip pengujian Gatling...'}
-                                        </span>
+                                        <span>AI sedang menyusun balasan...</span>
                                     </div>
-                                    <p className="text-[11px] text-slate-400 leading-relaxed">
-                                        Asisten menunggu hingga durasi uji beban selesai sepenuhnya dieksekusi oleh mesin Gatling sebelum menyusun dan mengembalikan laporan metrik akurat.
-                                    </p>
                                 </div>
                             </div>
                         )}
@@ -635,13 +714,12 @@ const GatlingCopilot = () => {
                             type="text"
                             value={chatInput}
                             onChange={(e) => setChatInput(e.target.value)}
-                            disabled={isChatLoading}
                             placeholder="Ketik instruksi pengujian (misal: 'Stress test 250 VU selama 30 detik')..."
                             className="flex-1 bg-slate-950 border border-slate-700 rounded-xl px-4 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-orange-500 focus:ring-1 focus:ring-orange-500 transition"
                         />
                         <button
                             type="submit"
-                            disabled={isChatLoading || !chatInput.trim()}
+                            disabled={!chatInput.trim()}
                             className="bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-500 hover:to-amber-500 text-white px-5 py-2.5 rounded-xl text-xs font-bold shadow-lg shadow-orange-600/20 disabled:opacity-40 transition flex items-center gap-1.5 cursor-pointer"
                         >
                             <span>Kirim</span>

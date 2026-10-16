@@ -28,3 +28,9 @@ Thumbs.db
 
 # ---- Logs ----
 *.log
+
+# ---- Hasil runtime Gatling (dibuat ulang saat test, bukan source) ----
+backend/reports/
+gatling-runner/results/
+gatling-runner/simulations/
+gatling-runner/.scala-build/

@@ -14,7 +14,11 @@ from sqlalchemy.orm import Session
 from ..auth.dependencies import get_current_user
 from ..database import get_db
 from ..models.models import User, GatlingTestRun, GatlingChatHistory
-from ..mcp import client as mcp_client
+# ==== PERAN MCP: HOST ====
+# gatling.py berperan sebagai MCP HOST (pemegang LLM + pengambil keputusan).
+# Bicara ke MCP SERVER lewat MCP CLIENT (mcp_client), memakai protokol MCP.
+# Alur: HOST (file ini) -> mcp_client (CLIENT) -> MCP SERVER (mcp-server/server.py)
+from ..mcp import client as mcp_client   # CLIENT: juru bicara protokol MCP
 from ..mcp.schema_adapter import mcp_tools_to_llm_schema
 from ..services.gatling_report_generator import generate_gatling_html_report
 from .chat import query_llm, resolve_preset
@@ -417,6 +421,120 @@ def clear_gatling_chat_history(
     return {"message": "Riwayat percakapan Gatling berhasil dihapus"}
 
 
+def _format_report_bubble(run: GatlingTestRun) -> str:
+    """
+    Susun teks bubble report yang dikirim ke chat saat job selesai.
+    Gaya: kalimat AI yang natural, menyebut nomor job + link laporan,
+    diikuti ringkasan metrik singkat.
+    """
+    report_link = f"http://localhost:8000/gatling/report/{run.id}/html"
+
+    if run.status == "failed":
+        return (
+            f"Mohon maaf, pengujian **Gatling nomor #{run.id}** ({run.simulation_name}) "
+            f"gagal dieksekusi.\n"
+            f"Keterangan: {run.scenario_description or 'Eksekusi Gatling gagal.'}\n"
+            f"Silakan coba jalankan ulang pengujian."
+        )
+
+    return (
+        f"Berikut hasil untuk **Gatling nomor #{run.id}** ({run.simulation_name}). "
+        f"Pengujian ke `{run.target_queue}` dengan {run.virtual_users} VUs selama "
+        f"{run.duration_seconds} detik telah selesai dieksekusi.\n\n"
+        f"Ringkasan performa:\n"
+        f"• Total Request: {run.total_requests:,} ({run.successful_requests:,} sukses, {run.failed_requests} gagal)\n"
+        f"• Error Rate: {run.error_rate}%\n"
+        f"• Latency: Mean {run.mean_response_time} ms | P95 {run.p95_response_time} ms | P99 {run.p99_response_time} ms\n\n"
+        f"Hasil lengkap dapat dilihat di link berikut:\n{report_link}"
+    )
+
+
+@router.post("/reset-queue")
+def reset_queued_jobs(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Membatalkan semua job milik user yang masih ANTRE (status 'queued') agar slot
+    paralel terbuka untuk permintaan baru. Job yang sedang 'running' TIDAK dibatalkan
+    karena Gatling-nya sudah berjalan di worker.
+
+    Job yang dibatalkan ditandai status 'cancelled'. Worker akan melewati pesan
+    RabbitMQ untuk job cancelled (lihat run_queued_job).
+    """
+    queued = (
+        db.query(GatlingTestRun)
+        .filter(
+            GatlingTestRun.user_id == current_user.id,
+            GatlingTestRun.status == "queued",
+        )
+        .all()
+    )
+    count = len(queued)
+    for run in queued:
+        run.status = "cancelled"
+        run.report_posted_to_chat = True  # jangan munculkan sebagai report di chat
+    db.commit()
+
+    running = (
+        db.query(GatlingTestRun)
+        .filter(
+            GatlingTestRun.user_id == current_user.id,
+            GatlingTestRun.status == "running",
+        )
+        .count()
+    )
+    return {
+        "cancelled": count,
+        "still_running": running,
+        "message": (
+            f"{count} job antrean dibatalkan. "
+            f"{running} job masih berjalan dan tidak dapat dibatalkan."
+        ),
+    }
+
+
+@router.get("/chat/updates", response_model=List[GatlingChatMessageItem])
+def poll_gatling_chat_updates(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Polling: cari job yang sudah selesai (completed/failed) tapi laporannya BELUM
+    dikirim ke chat. Untuk tiap job seperti itu, buat satu pesan AI berisi ringkasan
+    laporan, tandai sudah dikirim, lalu kembalikan daftar pesan baru.
+
+    Frontend memanggil ini berkala; pesan yang dikembalikan ditampilkan sebagai
+    bubble baru. Inilah mekanisme "report muncul otomatis" tanpa blocking chat.
+    """
+    pending = (
+        db.query(GatlingTestRun)
+        .filter(
+            GatlingTestRun.user_id == current_user.id,
+            GatlingTestRun.status.in_(["completed", "failed"]),
+            GatlingTestRun.report_posted_to_chat.is_(False),
+        )
+        .order_by(GatlingTestRun.id.asc())
+        .all()
+    )
+
+    new_messages: List[GatlingChatMessageItem] = []
+    for run in pending:
+        bubble = _format_report_bubble(run)
+        chat_item = GatlingChatHistory(user_id=current_user.id, role="ai", message=bubble)
+        db.add(chat_item)
+        run.report_posted_to_chat = True
+        db.commit()
+        db.refresh(chat_item)
+        new_messages.append(
+            GatlingChatMessageItem(
+                id=chat_item.id, role="ai", text=bubble, created_at=chat_item.created_at
+            )
+        )
+
+    return new_messages
+
+
 @router.post("/chat", response_model=GatlingChatResponse)
 async def chat_with_gatling_ai(
     request: GatlingChatRequest,
@@ -453,18 +571,23 @@ async def chat_with_gatling_ai(
         f"• UJI BEBAN DENGAN LOGIN / AUTENTIKASI: DIDUKUNG PENUH (100% BISA).\n"
         f"  - Parameter login yang tersedia: Username='manager_mark', Password='Admin123', Captcha='abc'.\n"
         f"  - Arsitektur login: IdentityServer3 OpenID Connect (OIDC). Form POST mengekstrak anti-forgery token (idsrv.xsrf) dan dynamic captcha GUID dari modelJson, lalu memformat username: `manager_mark#abc#{{captchaGuid}}`. Setelah POST login berhasil (HTTP 302), server mengarahkan ke authorize callback dan menerbitkan `.AspNet.Cookies` session cookies.\n"
-        f"• RabbitMQ Broker: Dijalankan lokal di laptop pengguna (host localhost:5672 atau antrean seperti fintracks.orders, fintracks.transactions).\n\n"
+        f"• RabbitMQ Broker: Dijalankan lokal di laptop pengguna (host localhost:5672) sebagai antrian job pengujian.\n\n"
         f"Anda memiliki akses ke MCP Tools khusus Gatling & RabbitMQ:\n"
-        f"1. generate_gatling_script: Menghasilkan skrip simulasi Gatling (Scala DSL). Mampu menangani target URL HTTP/HTTPS biasa, pengujian login terotentikasi (dengan login_username, login_password, login_captcha), maupun antrean AMQP RabbitMQ.\n"
-        f"2. trigger_gatling_test: Memicu eksekusi simulasi pengujian beban (termasuk skenario login jika login_username & login_password diberikan) dan mencatat hasilnya (latency, p95/p99, throughput, error rate) ke database.\n"
-        f"3. get_gatling_history: Melihat riwayat pengujian beban yang pernah dilakukan pengguna.\n"
-        f"4. get_gatling_report: Melihat detail metrik dan analisis laporan pengujian tertentu berdasarkan ID.\n"
-        f"5. get_rabbitmq_queue_status: Memeriksa metrik atau ketersediaan antrean RabbitMQ.\n\n"
-        f"PRINSIP EKSEKUSI NYATA & INTEGRASI GATLING:\n"
-        f"• Jika pengguna bertanya 'apakah bisa test pakai login?' atau memberikan username/pass/captcha, konfirmasi dengan antusias dan jelas bahwa BISA SEKALI (100% didukung). Jelaskan alur OIDC handshake, token extraction, dan format username kompositnya.\n"
-        f"• Jika pengguna meminta 'jalankan test', 'uji URL', 'test login', selalu panggil 'trigger_gatling_test' dengan target_queue='https://192.168.18.57:44396/' dan sertakan login_username='manager_mark', login_password='Admin123', login_captcha='abc' bila relevan.\n"
-        f"• Mesin Gatling mengeksekusi uji beban secara nyata selama durasi penuh (misalnya 20 detik penuh).\n"
-        f"• Setelah tool selesai dieksekusi, sajikan laporan akhir secara profesional, ramah, dan transparan dalam Bahasa Indonesia."
+        f"1. generate_gatling_script: Menghasilkan skrip simulasi Gatling (Scala DSL).\n"
+        f"2. enqueue_gatling_test: Menitipkan job pengujian beban ke antrian RabbitMQ (ASINKRON), langsung mengembalikan nomor job.\n"
+        f"3. get_queue_status: Memeriksa status antrian job saat ini (berapa running, queued, selesai).\n"
+        f"4. get_gatling_history: Melihat riwayat pengujian yang pernah dilakukan.\n"
+        f"5. get_gatling_report: Melihat detail laporan pengujian tertentu berdasarkan ID.\n\n"
+        f"ATURAN KETAT PEMILIHAN TOOL (SANGAT PENTING):\n"
+        f"1. JALANKAN TEST hanya jika pengguna JELAS MEMERINTAHKAN menjalankan, contoh: 'jalankan stress test...', 'uji beban...', 'test login...', 'stress test 100 VU 30 detik'. Hanya untuk ini panggil 'enqueue_gatling_test'.\n"
+        f"2. Jika pengguna BERTANYA STATUS ANTRIAN (contoh: 'antrian berapa', 'ada berapa job', 'status pengujian', 'berapa yang sedang jalan', 'sekarang antrian berapa'), panggil 'get_queue_status'. JANGAN menjalankan test baru.\n"
+        f"3. Jika pengguna bertanya RIWAYAT atau LAPORAN tertentu, panggil 'get_gatling_history' atau 'get_gatling_report'.\n"
+        f"4. Jika pengguna hanya menyapa, bertanya umum, atau berdiskusi (bukan perintah menjalankan test), JAWAB LANGSUNG tanpa memanggil tool apa pun. JANGAN pernah mengarang job, nomor job, atau hasil.\n"
+        f"5. JANGAN PERNAH mengarang nama antrian, Job ID, atau metrik. Job ID selalu berupa angka dari sistem, bukan nama. Jika tidak yakin, panggil get_queue_status atau tanyakan ke pengguna.\n\n"
+        f"PRINSIP EKSEKUSI:\n"
+        f"• Saat menjalankan test, gunakan target_queue sesuai permintaan pengguna; jika pengguna menyebut target utama tanpa URL spesifik, pakai 'https://192.168.18.57:44396/' dengan login_username='manager_mark', login_password='Admin123', login_captcha='abc' bila relevan.\n"
+        f"• Job diproses ASINKRON. Setelah enqueue, beri tahu pengguna pengujian sedang berjalan dan laporannya akan MUNCUL OTOMATIS di chat begitu selesai. JANGAN mengarang metrik; hasil nyata dikirim belakangan oleh sistem.\n"
+        f"• Jawab ramah, profesional, dan jujur dalam Bahasa Indonesia."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -494,8 +617,13 @@ async def chat_with_gatling_ai(
             fn_name = tc.get("function", {}).get("name")
             fn_args = tc.get("function", {}).get("arguments", {})
 
+            # NON-BLOCKING: alihkan trigger (sinkron, menunggu) ke enqueue (antrian).
+            # Ini jaring pengaman bila LLM tetap memilih trigger_gatling_test.
+            if fn_name == "trigger_gatling_test":
+                fn_name = "enqueue_gatling_test"
+
             # Suntikkan user_id ke tool yang membutuhkannya
-            if fn_name in ("trigger_gatling_test", "get_gatling_history", "get_gatling_report"):
+            if fn_name in ("enqueue_gatling_test", "get_gatling_history", "get_gatling_report", "get_queue_status"):
                 fn_args["user_id"] = user_id
 
             try:
@@ -504,21 +632,24 @@ async def chat_with_gatling_ai(
             except Exception as e:
                 tool_outputs.append(f"Error memanggil tool '{fn_name}': {e}")
 
-        # Ronde 2: Sintesis
+        # Ronde 2: Sintesis. Untuk enqueue, job BELUM selesai — jadi AI hanya
+        # mengonfirmasi job masuk antrian, TIDAK mengarang metrik. Report asli
+        # dikirim belakangan lewat polling /gatling/chat/updates.
         synthesis_messages = [
             {
                 "role": "system",
                 "content": (
                     "Anda adalah FinTracks Performance Testing & Gatling Specialist Assistant. "
-                    "Tugas Anda menyampaikan laporan akhir pengujian setelah mesin Gatling selesai mengeksekusi pengujian secara penuh dan nyata. "
-                    "Sampaikan kepada pengguna secara ramah, profesional, dan jelas dalam Bahasa Indonesia bahwa proses pengujian telah tuntas "
-                    "dieksekusi 100% oleh mesin Gatling selama durasi penuh. Sajikan rincian metrik performa (throughput, P95, P99, error rate) "
-                    "dan tautan laporan resmi Gatling HTML dengan rapi menggunakan markdown."
+                    "Hasil tool di bawah adalah konfirmasi bahwa job uji beban telah MASUK ANTRIAN dan sedang/akan dieksekusi worker di latar belakang. "
+                    "Sampaikan secara ramah dan singkat dalam Bahasa Indonesia bahwa pengujian sedang diproses, sebutkan nomor Job-nya bila ada, "
+                    "dan beri tahu pengguna bahwa laporan performa lengkap akan MUNCUL OTOMATIS di chat begitu selesai. "
+                    "JANGAN mengarang angka metrik (throughput/p95/p99) karena hasil belum tersedia. "
+                    "Beri tahu pengguna bahwa mereka boleh melanjutkan percakapan sambil menunggu."
                 ),
             },
             {
                 "role": "user",
-                "content": f"Pesan Pengguna: '{user_msg}'\nHasil Eksekusi Tool (Telah tuntas dieksekusi selama durasi penuh): {tool_outputs[0]}",
+                "content": f"Pesan Pengguna: '{user_msg}'\nHasil Tool (job masuk antrian): {tool_outputs[0]}",
             },
         ]
         synth_resp, _ = query_llm(model_mode, synthesis_messages)

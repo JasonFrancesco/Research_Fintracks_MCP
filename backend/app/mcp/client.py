@@ -1,15 +1,19 @@
 """
-MCP client untuk backend FinTracks.
+=============================================================================
+ PERAN MCP: CLIENT (MCP Client)
+=============================================================================
+File ini adalah MCP CLIENT. Perannya dalam arsitektur Model Context Protocol:
 
-Backend adalah MCP host+client: ia memegang LLM dan berbicara ke mcp-server
-memakai protokol MCP yang sebenarnya (initialize -> tools/list -> tools/call)
-di atas transport HTTP streamable. Ini menggantikan pemanggilan REST
-`POST /call` buatan sendiri pada versi lama.
+    [MCP HOST: chat.py/gatling.py] --> [MCP CLIENT: file ini] --> [MCP SERVER]
 
-Pola koneksi: connect -> initialize -> operasi -> close, dilakukan per operasi.
-Server berjalan dengan stateless_http=True sehingga tiap request berdiri sendiri,
-dan pola ini membuat backend tahan terhadap server MCP yang sempat restart tanpa
-perlu mengelola sesi persisten atau logika reconnect yang rumit.
+- CLIENT adalah "juru bicara protokol": ia menerjemahkan keinginan HOST
+  menjadi pesan MCP standar ke SERVER (initialize -> tools/list -> tools/call).
+- CLIENT tidak memegang LLM dan tidak menyediakan tool; ia hanya menghubungkan
+  HOST ke SERVER memakai SDK MCP resmi (streamablehttp_client + ClientSession).
+- Menggantikan pemanggilan REST `POST /call` buatan sendiri pada versi lama.
+
+Pola koneksi: connect -> initialize -> operasi -> close, per operasi.
+=============================================================================
 """
 import os
 from contextlib import asynccontextmanager
