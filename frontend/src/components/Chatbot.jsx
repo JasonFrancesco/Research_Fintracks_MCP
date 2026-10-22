@@ -1,5 +1,21 @@
 import React, { useState, useEffect, useRef } from 'react';
 import api from '../services/api';
+import dendenMushi from '../assets/den-den-mushi.jpg';
+
+// Konfigurasi presentasi per tema. Hanya memengaruhi tampilan header & avatar;
+// seluruh logika chat tetap sama untuk semua tema.
+const THEMES = {
+    fintracks: {
+        title: 'FinTracks AI',
+        headerClass: 'bg-blue-600',
+        avatar: { type: 'emoji', value: '🤖' },
+    },
+    onepiece: {
+        title: 'AI Assistant',
+        headerClass: 'bg-gradient-to-r from-red-700 to-amber-600',
+        avatar: { type: 'image', src: dendenMushi, alt: 'Den Den Mushi', fallback: '🐌' },
+    },
+};
 
 // Clipboard API hanya tersedia di secure context (https atau localhost).
 // Kalau frontend dibuka lewat IP LAN, misalnya http://192.168.x.x:3000,
@@ -92,7 +108,9 @@ const CopyButton = ({ text, isUser }) => {
     );
 };
 
-const Chatbot = () => {
+const Chatbot = ({ theme = 'fintracks' }) => {
+    const activeTheme = THEMES[theme] || THEMES.fintracks;
+    const [avatarFailed, setAvatarFailed] = useState(false);
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState('');
     const [isLoading, setIsLoading] = useState(false);
@@ -210,11 +228,23 @@ const Chatbot = () => {
     return (
         <div className="fixed bottom-24 right-6 w-96 h-[520px] bg-white rounded-2xl shadow-2xl border border-gray-200 flex flex-col overflow-hidden z-40">
             {/* Header */}
-            <div className="bg-blue-600 p-3.5 text-white flex flex-col gap-2 shadow">
+            <div className={`${activeTheme.headerClass} p-3.5 text-white flex flex-col gap-2 shadow`}>
                 <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
+                        {activeTheme.avatar.type === 'image' && !avatarFailed ? (
+                            <img
+                                src={activeTheme.avatar.src}
+                                alt={activeTheme.avatar.alt}
+                                className="w-6 h-6 rounded-full object-cover bg-white/20"
+                                onError={() => setAvatarFailed(true)}
+                            />
+                        ) : activeTheme.avatar.type === 'image' ? (
+                            <span className="text-lg">{activeTheme.avatar.fallback}</span>
+                        ) : (
+                            <span className="text-lg">{activeTheme.avatar.value}</span>
+                        )}
                         <div className="w-2.5 h-2.5 bg-green-400 rounded-full animate-pulse"></div>
-                        <span className="font-bold text-sm">FinTracks AI</span>
+                        <span className="font-bold text-sm">{activeTheme.title}</span>
                     </div>
                     {messages.length > 0 && (
                         <button

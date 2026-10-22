@@ -6,7 +6,9 @@ import Register from './pages/Register';
 import Dashboard from './pages/Dashboard';
 import GatlingDashboard from './pages/GatlingDashboard';
 import GatlingCopilot from './pages/GatlingCopilot';
+import OnePiece from './pages/OnePiece';
 import Chatbot from './components/Chatbot';
+import dendenMushi from './assets/den-den-mushi.jpg';
 
 const ProtectedRoute = ({ children }) => {
     const { user, loading } = useContext(AuthContext);
@@ -33,6 +35,34 @@ const DashboardLayout = () => {
                 title="FinTracks AI Chatbot"
             >
                 <span className="text-2xl">🤖</span>
+            </button>
+        </div>
+    );
+};
+
+const OnePieceLayout = () => {
+    const [showChatbot, setShowChatbot] = useState(false);
+    const [iconFailed, setIconFailed] = useState(false);
+    return (
+        <div className="relative">
+            <OnePiece />
+            {showChatbot && <Chatbot theme="onepiece" />}
+            <button
+                onClick={() => setShowChatbot(!showChatbot)}
+                className="fixed bottom-6 right-6 bg-red-700 text-white p-4 rounded-full shadow-2xl hover:bg-red-800 transition-all z-50 flex items-center justify-center hover:scale-105 active:scale-95 overflow-hidden"
+                style={{ width: '60px', height: '60px' }}
+                title="One Piece AI Assistant"
+            >
+                {iconFailed ? (
+                    <span className="text-2xl">🐌</span>
+                ) : (
+                    <img
+                        src={dendenMushi}
+                        alt="Den Den Mushi"
+                        className="w-8 h-8 object-cover rounded-full"
+                        onError={() => setIconFailed(true)}
+                    />
+                )}
             </button>
         </div>
     );
@@ -67,6 +97,14 @@ const App = () => {
                         element={
                             <ProtectedRoute>
                                 <GatlingCopilot />
+                            </ProtectedRoute>
+                        }
+                    />
+                    <Route
+                        path="/anime"
+                        element={
+                            <ProtectedRoute>
+                                <OnePieceLayout />
                             </ProtectedRoute>
                         }
                     />

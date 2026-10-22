@@ -152,6 +152,12 @@ const Dashboard = () => {
                     <h1 className="text-3xl font-bold text-gray-800">Financial Dashboard</h1>
                     <div className="flex gap-3 items-center">
                         <button
+                            onClick={() => navigate('/anime')}
+                            className="bg-gradient-to-r from-red-600 to-amber-500 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:from-red-700 hover:to-amber-600 transition-all shadow-sm flex items-center gap-2"
+                        >
+                            <span>🏴‍☠️</span> Anime
+                        </button>
+                        <button
                             onClick={() => navigate('/gatling')}
                             className="bg-gradient-to-r from-orange-500 to-amber-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:from-orange-600 hover:to-amber-700 transition-all shadow-sm flex items-center gap-2"
                         >
