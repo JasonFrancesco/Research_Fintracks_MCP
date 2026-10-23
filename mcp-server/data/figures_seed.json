@@ -1,0 +1,98 @@
+[
+  {
+    "id": "op-luffy-001",
+    "nama": "Monkey D. Luffy Gear 5 Figuarts ZERO",
+    "karakter": "Luffy",
+    "brand": "Bandai",
+    "skala": "Non-scale",
+    "tinggi_cm": 22.0,
+    "harga": 1250000,
+    "stok": 4,
+    "image_url": "https://down-id.img.susercontent.com/placeholder-luffy-gear5.jpg",
+    "shopee_url": "https://shopee.co.id/search?keyword=figure%20luffy%20gear%205%20bandai"
+  },
+  {
+    "id": "op-luffy-002",
+    "nama": "Monkey D. Luffy King of Artist Wano",
+    "karakter": "Luffy",
+    "brand": "Banpresto",
+    "skala": "Non-scale",
+    "tinggi_cm": 18.0,
+    "harga": 320000,
+    "stok": 12,
+    "image_url": "https://down-id.img.susercontent.com/placeholder-luffy-koa.jpg",
+    "shopee_url": "https://shopee.co.id/search?keyword=figure%20luffy%20king%20of%20artist"
+  },
+  {
+    "id": "op-zoro-001",
+    "nama": "Roronoa Zoro King of Artist Wano",
+    "karakter": "Zoro",
+    "brand": "Banpresto",
+    "skala": "Non-scale",
+    "tinggi_cm": 20.0,
+    "harga": 385000,
+    "stok": 10,
+    "image_url": "https://down-id.img.susercontent.com/placeholder-zoro-koa.jpg",
+    "shopee_url": "https://shopee.co.id/search?keyword=figure%20zoro%20king%20of%20artist"
+  },
+  {
+    "id": "op-zoro-002",
+    "nama": "Roronoa Zoro Portrait of Pirates P.O.P",
+    "karakter": "Zoro",
+    "brand": "MegaHouse",
+    "skala": "1/8",
+    "tinggi_cm": 24.0,
+    "harga": 1850000,
+    "stok": 3,
+    "image_url": "https://down-id.img.susercontent.com/placeholder-zoro-pop.jpg",
+    "shopee_url": "https://shopee.co.id/search?keyword=figure%20zoro%20portrait%20of%20pirates"
+  },
+  {
+    "id": "op-nami-001",
+    "nama": "Nami Portrait of Pirates Limited Edition",
+    "karakter": "Nami",
+    "brand": "MegaHouse",
+    "skala": "1/8",
+    "tinggi_cm": 23.0,
+    "harga": 1650000,
+    "stok": 5,
+    "image_url": "https://down-id.img.susercontent.com/placeholder-nami-pop.jpg",
+    "shopee_url": "https://shopee.co.id/search?keyword=figure%20nami%20portrait%20of%20pirates"
+  },
+  {
+    "id": "op-nami-002",
+    "nama": "Nami Glitter & Glamours Wano",
+    "karakter": "Nami",
+    "brand": "Banpresto",
+    "skala": "Non-scale",
+    "tinggi_cm": 25.0,
+    "harga": 295000,
+    "stok": 15,
+    "image_url": "https://down-id.img.susercontent.com/placeholder-nami-gng.jpg",
+    "shopee_url": "https://shopee.co.id/search?keyword=figure%20nami%20glitter%20glamours"
+  },
+  {
+    "id": "op-sanji-001",
+    "nama": "Vinsmoke Sanji King of Artist Wano",
+    "karakter": "Sanji",
+    "brand": "Banpresto",
+    "skala": "Non-scale",
+    "tinggi_cm": 19.0,
+    "harga": 350000,
+    "stok": 8,
+    "image_url": "https://down-id.img.susercontent.com/placeholder-sanji-koa.jpg",
+    "shopee_url": "https://shopee.co.id/search?keyword=figure%20sanji%20king%20of%20artist"
+  },
+  {
+    "id": "op-ace-001",
+    "nama": "Portgas D. Ace Figuarts ZERO Extra Battle",
+    "karakter": "Ace",
+    "brand": "Bandai",
+    "skala": "Non-scale",
+    "tinggi_cm": 21.0,
+    "harga": 980000,
+    "stok": 6,
+    "image_url": "https://down-id.img.susercontent.com/placeholder-ace-zero.jpg",
+    "shopee_url": "https://shopee.co.id/search?keyword=figure%20ace%20figuarts%20zero"
+  }
+]
