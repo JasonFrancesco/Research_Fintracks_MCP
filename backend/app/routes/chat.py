@@ -19,12 +19,14 @@ class ChatRequest(BaseModel):
     # nilai lama "cloud" masih diterima demi kompatibilitas
     message: str
     model: Optional[str] = "local"
+    use_rag: Optional[bool] = None   # None = pakai default endpoint (ON)
 
 class ChatResponse(BaseModel):
     model_config = {"protected_namespaces": ()}
 
     response: str
     model_used: Optional[str] = None
+    products: Optional[List[Dict[str, Any]]] = None   # default None, absen dari JSON
 
 class ChatMessageItem(BaseModel):
     id: int
@@ -848,6 +850,11 @@ def _extract_tx_type(user_msg: str) -> Optional[str]:
 
 def sanitize_tool_args(tool_name: str, args: dict, user_id: int, user_msg: str) -> dict:
     """Sanitasi dan melengkapi argumen tool sebelum dikirim ke MCP Server"""
+    # Tool non-transaksi (figure tools) tidak memerlukan user_id dan tidak punya
+    # sanitasi khusus. Kembalikan argumen apa adanya SEBELUM injeksi user_id.
+    if tool_name in ("search_figures", "search_figure_knowledge"):
+        return args
+
     args["user_id"] = user_id
     today_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -992,6 +999,7 @@ async def chat_with_ai(
     model_mode = preset["id"]
     model_label = f"{preset['id']} ({preset['model']})"
     today_str = datetime.now().strftime("%Y-%m-%d")
+    use_rag = True if request.use_rag is None else bool(request.use_rag)
 
     # 1. Simpan pesan user ke database (untuk riwayat & memory percakapan)
     save_chat_message(db, user_id, "user", user_msg)
@@ -1032,6 +1040,20 @@ async def chat_with_ai(
         f"7. AI Models harus pintar dan jelas dalam memutuskan tool mana yang dipanggil kemudian harus menjawab dengan jelas."
     )
 
+    system_prompt += (
+        "\n\nTOOL REKOMENDASI FIGURE ONE PIECE:\n"
+        "- search_figures: mencari PRODUK figure (nama, brand, skala, harga, stok, link Shopee).\n"
+        "- search_figure_knowledge: mencari PENGETAHUAN figure (skala, brand, bahan, tips) — "
+        "hanya tersedia bila RAG aktif.\n"
+        "ATURAN FIGURE:\n"
+        "A. Untuk permintaan rekomendasi/pencarian figure One Piece "
+        "(mis. 'rekomendasikan figure Luffy di bawah 500rb'), panggil search_figures UNTUK PRODUK. "
+        "Jika search_figure_knowledge tersedia, panggil JUGA untuk melengkapi dengan pengetahuan. "
+        "Gabungkan hasil keduanya menjadi satu rekomendasi.\n"
+        "B. JANGAN memanggil tool figure untuk pertanyaan keuangan/transaksi. "
+        "Tool keuangan dan tool figure tidak boleh dicampur dalam satu jawaban."
+    )
+
 
     # Susun daftar pesan untuk LLM: system prompt dulu, lalu riwayat lama,
     # terakhir pesan user saat ini. Format {role, content} ini standar chat LLM.
@@ -1053,6 +1075,14 @@ async def chat_with_ai(
         # umum tanpa tool, dan error-nya transparan di log.
         print(f"[MCP] Gagal mengambil daftar tool dari server MCP: {type(e).__name__}: {e}")
         tools_schema = []
+
+    # RAG OFF: sembunyikan HANYA tool pengetahuan; tool lain tetap utuh.
+    # Filter dilakukan di sisi HOST, bukan di MCP server.
+    if not use_rag:
+        tools_schema = [
+            t for t in tools_schema
+            if t.get("function", {}).get("name") != "search_figure_knowledge"
+        ]
 
     # Step 1: Panggil LLM RONDE 1 = tahap KEPUTUSAN.
     # LLM melihat pesan + daftar tool, lalu memutuskan: jawab langsung, atau
@@ -1077,6 +1107,7 @@ async def chat_with_ai(
     # Step 2: LLM memutuskan memanggil tool -> jalankan tool-nya lewat MCP.
     if tool_calls:
         tool_outputs = []
+        executed_tool_names = []   # paralel dengan tool_outputs
 
         # LLM bisa meminta lebih dari satu tool; proses satu per satu.
         for idx, tool_call in enumerate(tool_calls, start=1):
@@ -1103,23 +1134,39 @@ async def chat_with_ai(
                 mcp_result = f"Gagal terhubung ke MCP Server saat memanggil '{fn_name}': {e}"
             print(f"[BENCHMARK]     hasil MCP      : {str(mcp_result)[:160]}")
             tool_outputs.append(str(mcp_result or "Operasi MCP selesai."))
+            executed_tool_names.append(fn_name)
 
-        if len(tool_outputs) > 1:
-            print(f"[BENCHMARK]   PERHATIAN: {len(tool_outputs)} tool dieksekusi, "
-                  f"tapi hanya hasil tool #1 yang dikirim ke tahap sintesis.")
+        # Ekstraksi products dari hasil search_figures pertama (sebelum sintesis).
+        # Parse gagal / bukan JSON / tanpa results -> products = None; request tetap sukses.
+        products = None
+        for name, out in zip(executed_tool_names, tool_outputs):
+            if name != "search_figures":
+                continue
+            try:
+                parsed = json.loads(out)
+                results = parsed.get("results")
+                if isinstance(results, list):
+                    products = results
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                products = None
+            break
 
         # Step 3: Panggil LLM RONDE 2 = tahap SINTESIS.
         # Hasil mentah dari tool (mis. "Ditemukan 2 pemasukan...") diubah jadi
-        # kalimat yang ramah dan enak dibaca. Catatan: hanya hasil tool PERTAMA
-        # (tool_outputs[0]) yang dikirim ke tahap ini.
+        # kalimat yang ramah dan enak dibaca. Seluruh output tool digabungkan
+        # (berlabel per tool) agar hasil produk dan pengetahuan ikut dirangkai.
+        combined_tool_output = "\n\n".join(
+            f"[Hasil tool: {name}]\n{out}"
+            for name, out in zip(executed_tool_names, tool_outputs)
+        )
         synthesis_messages = [
             {
                 "role": "system", 
-                "content": "Anda adalah FinTracks AI Assistant. Tugas Anda adalah menyampaikan hasil eksekusi MCP Tool kepada pengguna secara ramah, sopan, rapi, dan jelas dalam Bahasa Indonesia."
+                "content": "Anda adalah FinTracks AI Assistant. Tugas Anda adalah menyampaikan hasil eksekusi MCP Tool kepada pengguna secara ramah, sopan, rapi, dan jelas dalam Bahasa Indonesia. Bila ada hasil produk dan pengetahuan, gabungkan menjadi satu rekomendasi yang utuh."
             },
             {
                 "role": "user", 
-                "content": f"Pesan Pengguna: '{user_msg}'\nHasil Eksekusi MCP Tool: {tool_outputs[0]}"
+                "content": f"Pesan Pengguna: '{user_msg}'\nHasil Eksekusi MCP Tool:\n{combined_tool_output}"
             }
         ]
 
@@ -1129,12 +1176,12 @@ async def chat_with_ai(
         if synth_resp and synth_resp.get("content"):
             final_ai_msg = synth_resp["content"]
             save_chat_message(db, user_id, "ai", final_ai_msg)  # simpan jawaban ke riwayat
-            return ChatResponse(response=final_ai_msg, model_used=model_label)  # <-- balik ke frontend
+            return ChatResponse(response=final_ai_msg, model_used=model_label, products=products)  # <-- balik ke frontend
 
         # Cadangan: kalau sintesis gagal, tampilkan saja hasil mentah tool apa adanya.
         fallback_ai_msg = f"🤖 **FinTracks AI Assistant:**\n\n" + "\n\n".join(tool_outputs)
         save_chat_message(db, user_id, "ai", fallback_ai_msg)
-        return ChatResponse(response=fallback_ai_msg, model_used=model_label)
+        return ChatResponse(response=fallback_ai_msg, model_used=model_label, products=products)
 
     # Step 4: LLM tidak butuh tool (sapaan / pertanyaan umum) -> pakai jawaban ronde 1.
     direct_response = ai_resp.get("content", "")

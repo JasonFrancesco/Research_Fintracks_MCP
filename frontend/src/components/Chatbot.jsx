@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import api from '../services/api';
 import dendenMushi from '../assets/den-den-mushi.jpg';
+import FigureProductCard from './FigureProductCard';
 
 // Konfigurasi presentasi per tema. Hanya memengaruhi tampilan header & avatar;
 // seluruh logika chat tetap sama untuk semua tema.
@@ -110,6 +111,8 @@ const CopyButton = ({ text, isUser }) => {
 
 const Chatbot = ({ theme = 'fintracks' }) => {
     const activeTheme = THEMES[theme] || THEMES.fintracks;
+    const isOnePiece = theme === 'onepiece';
+    const [useRag, setUseRag] = useState(true);   // default ON, sinkron default backend
     const [avatarFailed, setAvatarFailed] = useState(false);
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState('');
@@ -187,10 +190,16 @@ const Chatbot = ({ theme = 'fintracks' }) => {
             // Jawaban baru datang setelah backend selesai: LLM -> MCP -> LLM.
             const response = await api.post('/chat/', {
                 message: input,
-                model: selectedModel  // preset model yang dipilih di dropdown
+                model: selectedModel,  // preset model yang dipilih di dropdown
+                ...(isOnePiece ? { use_rag: useRag } : {}),
             });
             // Tambahkan balasan AI ke daftar pesan supaya muncul di layar.
-            setMessages(prev => [...prev, { role: 'ai', text: response.data.response, created_at: new Date().toISOString() }]);
+            setMessages(prev => [...prev, {
+                role: 'ai',
+                text: response.data.response,
+                created_at: new Date().toISOString(),
+                products: isOnePiece ? (response.data.products || null) : null,
+            }]);
         } catch (error) {
             // Pesan seragam "gagal menghubungi AI" menyembunyikan penyebab sebenarnya.
             // Sebagian besar kegagalan di sini bukan soal AI: sesi habis, backend mati,
@@ -290,6 +299,25 @@ const Chatbot = ({ theme = 'fintracks' }) => {
                                 : `${activeOption.model} · ${activeOption.description || ''}`}
                         </p>
                     )}
+
+                    {isOnePiece && (
+                        <div className="flex items-center justify-between text-xs gap-2 pt-1 border-t border-blue-500/40">
+                            <label htmlFor="rag-toggle" className="text-blue-100 text-[11px] font-medium">
+                                RAG (pengetahuan figure)
+                            </label>
+                            <button
+                                id="rag-toggle"
+                                type="button"
+                                role="switch"
+                                aria-checked={useRag}
+                                onClick={() => setUseRag(v => !v)}
+                                disabled={isLoading}
+                                className={`px-2 py-0.5 rounded text-[11px] font-semibold border focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-300 disabled:opacity-60 ${useRag ? 'bg-green-600 border-green-400 text-white' : 'bg-gray-500 border-gray-400 text-white'}`}
+                            >
+                                {useRag ? 'RAG: ON' : 'RAG: OFF'}
+                            </button>
+                        </div>
+                    )}
                 </div>
             </div>
 
@@ -323,6 +351,13 @@ const Chatbot = ({ theme = 'fintracks' }) => {
                                 )}
                                 {msg.text && <CopyButton text={msg.text} isUser={msg.role === 'user'} />}
                             </div>
+                            {isOnePiece && Array.isArray(msg.products) && msg.products.length > 0 && (
+                                <div className="mt-2 w-[85%] space-y-2 self-start">
+                                    {msg.products.map((fig) => (
+                                        <FigureProductCard key={fig.id ?? fig.nama} figure={fig} />
+                                    ))}
+                                </div>
+                            )}
                         </div>
                     ))
                 )}
