@@ -44,6 +44,7 @@ from tools.gatling_tools import (
     get_rabbitmq_queue_status_tool,
     get_queue_status_tool
 )
+from rag.retriever import retrieve
 
 # Port & path endpoint MCP HTTP streamable. Backend terhubung ke
 # http://127.0.0.1:8001/mcp sebagai MCP client (protokol MCP, bukan REST).
@@ -164,6 +165,35 @@ def delete_transaction(transaction_id: int, user_id: int) -> str:
 def get_summary(user_id: int) -> str:
     """Mendapatkan ringkasan keuangan (Total Pemasukan, Total Pengeluaran, dan Saldo)."""
     return get_summary_tool(user_id)
+
+
+@mcp.tool()
+def search_figure_knowledge(query: str, top_k: int = 4) -> str:
+    """
+    Mencari pengetahuan figure anime One Piece (skala, brand, bahan, tips memilih)
+    dari basis pengetahuan RAG lokal. Gunakan untuk menjawab pertanyaan seputar
+    rekomendasi/karakteristik figure sebelum menyusun jawaban.
+    - query: pertanyaan atau kata kunci pengguna.
+    - top_k: jumlah potongan pengetahuan paling relevan (default 4).
+    """
+    try:
+        result = retrieve(query, top_k)
+    except Exception as e:
+        return f"Gagal mencari pengetahuan figure: {str(e)}"
+
+    note = result.get("note")
+    rows = result.get("results", [])
+    if not rows:
+        return note or "Tidak ada pengetahuan relevan yang ditemukan."
+
+    lines = []
+    for i, r in enumerate(rows, 1):
+        lines.append(
+            f"[{i}] (skor {r['score']:.3f}, sumber: {r['document']})\n{r['content']}"
+        )
+    header = f"Ditemukan {len(rows)} potongan pengetahuan relevan:"
+    body = "\n\n".join(lines)
+    return header + "\n\n" + body
 
 
 # --- Gatling & RabbitMQ Load Testing Tools ---
