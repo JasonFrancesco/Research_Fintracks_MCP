@@ -511,6 +511,77 @@ async def diagnose_models(
 
     return {"results": results}
 
+def extract_tool_calls_from_text(content: str, tools: list) -> list:
+    """
+    Memulihkan panggilan tool yang dicetak model lokal sebagai TEKS JSON di
+    'content' (bukan lewat mekanisme tool_calls resmi). Model kecil seperti
+    llama3.2:3b sering melakukan ini, sehingga tool tidak pernah tereksekusi.
+
+    Mengembalikan list tool_call ternormalisasi:
+        [{"function": {"name": <str>, "arguments": <dict>}}]
+    hanya untuk nama tool yang benar-benar ada di 'tools' (schema LLM). Bila tidak
+    ada JSON tool yang valid/dikenal, kembalikan list kosong.
+
+    Format yang dikenali (fleksibel), contoh:
+      {"name": "search_onepiece_characters", "parameters": {"query": "..."}}
+      {"name": "search_onepiece_characters", "arguments": {"query": "..."}}
+      {"tool": "...", "parameters": {...}}
+    """
+    if not content or "{" not in content:
+        return []
+
+    # Kumpulan nama tool yang sah dari schema yang dikirim ke LLM.
+    valid_names = set()
+    for t in tools or []:
+        name = (t.get("function", {}) or {}).get("name")
+        if name:
+            valid_names.add(name)
+    if not valid_names:
+        return []
+
+    # Pindai semua objek JSON seimbang di dalam teks (model kadang membungkus
+    # dengan teks lain atau blok ```json).
+    candidates = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(content):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start != -1:
+                    candidates.append(content[start:i + 1])
+                    start = -1
+
+    recovered = []
+    for blob in candidates:
+        try:
+            obj = json.loads(blob)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        name = obj.get("name") or obj.get("tool") or obj.get("tool_name")
+        if name not in valid_names:
+            continue
+        args = obj.get("parameters")
+        if not isinstance(args, dict):
+            args = obj.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, ValueError):
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
+        recovered.append({"function": {"name": name, "arguments": args}})
+
+    return recovered
+
+
 def get_active_model() -> str:
     from dotenv import load_dotenv
     load_dotenv(override=True)
@@ -690,7 +761,25 @@ def query_llm(preset_id: str, messages: list, tools: list = None) -> tuple[Optio
                 print(f"[Lokal] '{active_model}' adalah model reasoning: {len(thinking)} char proses berpikir "
                       f"(eval_count={res_data.get('eval_count')}). Ini penyebab utama respons lambat.")
 
-            return {"content": ai_message.get("content", "") or "", "tool_calls": ai_message.get("tool_calls", [])}, None
+            local_content = ai_message.get("content", "") or ""
+            local_tool_calls = ai_message.get("tool_calls", []) or []
+
+            # FALLBACK function-calling untuk model lokal kecil.
+            # Model seperti llama3.2:3b sering TIDAK memakai mekanisme tool_calls
+            # yang benar; alih-alih, ia mencetak panggilan tool sebagai TEKS JSON di
+            # 'content', mis. {"name":"search_onepiece_characters","parameters":{"query":"..."}}.
+            # Tanpa penanganan ini, tool tidak pernah dieksekusi dan RAG tidak jalan.
+            # Di sini kita deteksi pola itu dan ubah menjadi tool_calls yang sah
+            # sehingga loop eksekusi tool di chat_with_ai tetap berjalan.
+            if tools and not local_tool_calls and local_content:
+                recovered = extract_tool_calls_from_text(local_content, tools)
+                if recovered:
+                    print(f"[Lokal] Model mencetak tool call sebagai teks. Dipulihkan {len(recovered)} tool call "
+                          f"dari content -> {[c['function']['name'] for c in recovered]}")
+                    local_tool_calls = recovered
+                    local_content = ""  # JSON mentah jangan ikut jadi jawaban
+
+            return {"content": local_content, "tool_calls": local_tool_calls}, None
 
         except requests.exceptions.Timeout:
             return None, (
