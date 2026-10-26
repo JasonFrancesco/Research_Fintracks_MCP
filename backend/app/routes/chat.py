@@ -850,9 +850,9 @@ def _extract_tx_type(user_msg: str) -> Optional[str]:
 
 def sanitize_tool_args(tool_name: str, args: dict, user_id: int, user_msg: str) -> dict:
     """Sanitasi dan melengkapi argumen tool sebelum dikirim ke MCP Server"""
-    # Tool non-transaksi (figure tools) tidak memerlukan user_id dan tidak punya
+    # Tool pengetahuan karakter tidak memerlukan user_id dan tidak punya
     # sanitasi khusus. Kembalikan argumen apa adanya SEBELUM injeksi user_id.
-    if tool_name in ("search_figures", "search_figure_knowledge"):
+    if tool_name == "search_onepiece_characters":
         return args
 
     args["user_id"] = user_id
@@ -1041,17 +1041,22 @@ async def chat_with_ai(
     )
 
     system_prompt += (
-        "\n\nTOOL REKOMENDASI FIGURE ONE PIECE:\n"
-        "- search_figures: mencari PRODUK figure (nama, brand, skala, harga, stok, link Shopee).\n"
-        "- search_figure_knowledge: mencari PENGETAHUAN figure (skala, brand, bahan, tips) — "
-        "hanya tersedia bila RAG aktif.\n"
-        "ATURAN FIGURE:\n"
-        "A. Untuk permintaan rekomendasi/pencarian figure One Piece "
-        "(mis. 'rekomendasikan figure Luffy di bawah 500rb'), panggil search_figures UNTUK PRODUK. "
-        "Jika search_figure_knowledge tersedia, panggil JUGA untuk melengkapi dengan pengetahuan. "
-        "Gabungkan hasil keduanya menjadi satu rekomendasi.\n"
-        "B. JANGAN memanggil tool figure untuk pertanyaan keuangan/transaksi. "
-        "Tool keuangan dan tool figure tidak boleh dicampur dalam satu jawaban."
+        "\n\nTOOL PENGETAHUAN KARAKTER ONE PIECE:\n"
+        "- search_onepiece_characters: mencari PENGETAHUAN karakter One Piece "
+        "(nama, julukan, afiliasi, kru/bajak laut, peran, bounty, buah iblis/"
+        "devil fruit, tipe buah iblis) dari basis pengetahuan RAG karakter. "
+        "Tool ini HANYA tersedia bila RAG aktif.\n"
+        "ATURAN KARAKTER ONE PIECE:\n"
+        "A. Untuk pertanyaan APA PUN tentang karakter One Piece (siapa, julukan, "
+        "afiliasi, kru/bajak laut mana, peran, berapa bounty, buah iblis apa, "
+        "tipe buah iblis), WAJIB panggil search_onepiece_characters dengan "
+        "query berisi pertanyaan pengguna. JANGAN menjawab dari ingatan model.\n"
+        "B. Susun jawaban HANYA berdasarkan konteks yang dikembalikan tool. "
+        "Jika tool tidak mengembalikan informasi yang relevan, katakan terus "
+        "terang bahwa Anda tidak tahu. JANGAN mengarang atau menebak fakta.\n"
+        "C. JANGAN memanggil search_onepiece_characters untuk pertanyaan "
+        "keuangan/transaksi atau gatling/load test. Tool karakter dan tool "
+        "keuangan/gatling tidak boleh dicampur dalam satu jawaban."
     )
 
 
@@ -1076,12 +1081,14 @@ async def chat_with_ai(
         print(f"[MCP] Gagal mengambil daftar tool dari server MCP: {type(e).__name__}: {e}")
         tools_schema = []
 
-    # RAG OFF: sembunyikan HANYA tool pengetahuan; tool lain tetap utuh.
-    # Filter dilakukan di sisi HOST, bukan di MCP server.
+    # RAG OFF: sembunyikan HANYA tool pengetahuan RAG karakter; tool lain
+    # (transaksi & gatling) tetap utuh. Dengan tool karakter disembunyikan,
+    # LLM terpaksa menjawab dari ingatannya sendiri -> berguna untuk demo
+    # perbandingan RAG ON vs OFF. Filter dilakukan di sisi HOST, bukan server.
     if not use_rag:
         tools_schema = [
             t for t in tools_schema
-            if t.get("function", {}).get("name") != "search_figure_knowledge"
+            if t.get("function", {}).get("name") != "search_onepiece_characters"
         ]
 
     # Step 1: Panggil LLM RONDE 1 = tahap KEPUTUSAN.
@@ -1136,20 +1143,10 @@ async def chat_with_ai(
             tool_outputs.append(str(mcp_result or "Operasi MCP selesai."))
             executed_tool_names.append(fn_name)
 
-        # Ekstraksi products dari hasil search_figures pertama (sebelum sintesis).
-        # Parse gagal / bukan JSON / tanpa results -> products = None; request tetap sukses.
+        # Katalog produk figure sudah dihapus, jadi tidak ada lagi daftar produk
+        # yang dikirim ke frontend. Field 'products' dipertahankan di ChatResponse
+        # demi kompatibilitas, tetapi selalu None.
         products = None
-        for name, out in zip(executed_tool_names, tool_outputs):
-            if name != "search_figures":
-                continue
-            try:
-                parsed = json.loads(out)
-                results = parsed.get("results")
-                if isinstance(results, list):
-                    products = results
-            except (json.JSONDecodeError, TypeError, AttributeError):
-                products = None
-            break
 
         # Step 3: Panggil LLM RONDE 2 = tahap SINTESIS.
         # Hasil mentah dari tool (mis. "Ditemukan 2 pemasukan...") diubah jadi
@@ -1162,7 +1159,7 @@ async def chat_with_ai(
         synthesis_messages = [
             {
                 "role": "system", 
-                "content": "Anda adalah FinTracks AI Assistant. Tugas Anda adalah menyampaikan hasil eksekusi MCP Tool kepada pengguna secara ramah, sopan, rapi, dan jelas dalam Bahasa Indonesia. Bila ada hasil produk dan pengetahuan, gabungkan menjadi satu rekomendasi yang utuh."
+                "content": "Anda adalah FinTracks AI Assistant. Tugas Anda adalah menyampaikan hasil eksekusi MCP Tool kepada pengguna secara ramah, sopan, rapi, dan jelas dalam Bahasa Indonesia. Jawab HANYA berdasarkan hasil tool; bila beberapa tool dipakai, gabungkan seluruh hasilnya menjadi satu jawaban yang utuh. Jika hasil tool menyatakan data tidak ditemukan, sampaikan apa adanya dan jangan mengarang."
             },
             {
                 "role": "user", 

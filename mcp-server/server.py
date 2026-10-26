@@ -44,8 +44,6 @@ from tools.gatling_tools import (
     get_rabbitmq_queue_status_tool,
     get_queue_status_tool
 )
-from rag.retriever import retrieve
-from tools.figure_tools import search_figures_tool
 from character_rag.retriever import retrieve as retrieve_characters
 
 # Port & path endpoint MCP HTTP streamable. Backend terhubung ke
@@ -170,71 +168,6 @@ def get_summary(user_id: int) -> str:
 
 
 @mcp.tool()
-def search_figure_knowledge(query: str, top_k: int = 4) -> str:
-    """
-    Mencari pengetahuan figure anime One Piece (skala, brand, bahan, tips memilih)
-    dari basis pengetahuan RAG lokal. Gunakan untuk menjawab pertanyaan seputar
-    rekomendasi/karakteristik figure sebelum menyusun jawaban.
-    - query: pertanyaan atau kata kunci pengguna.
-    - top_k: jumlah potongan pengetahuan paling relevan (default 4).
-    """
-    try:
-        result = retrieve(query, top_k)
-    except Exception as e:
-        return f"Gagal mencari pengetahuan figure: {str(e)}"
-
-    note = result.get("note")
-    rows = result.get("results", [])
-    if not rows:
-        return note or "Tidak ada pengetahuan relevan yang ditemukan."
-
-    lines = []
-    for i, r in enumerate(rows, 1):
-        lines.append(
-            f"[{i}] (skor {r['score']:.3f}, sumber: {r['document']})\n{r['content']}"
-        )
-    header = f"Ditemukan {len(rows)} potongan pengetahuan relevan:"
-    body = "\n\n".join(lines)
-    return header + "\n\n" + body
-
-
-@mcp.tool()
-def search_figures(
-    query: str = "",
-    max_price: Optional[float] = None,
-    min_height: Optional[float] = None,
-    max_height: Optional[float] = None,
-    brand: Optional[str] = None,
-    limit: int = 5,
-) -> str:
-    """
-    Mencari DATA PRODUK figure anime One Piece (nama, karakter, brand, skala,
-    tinggi, harga Rupiah, stok, gambar, link Shopee) dari katalog figure.
-    Gunakan tool INI saat pengguna ingin MEMBELI atau MELIHAT figure yang
-    tersedia beserta harga dan stoknya. Untuk pertanyaan PENGETAHUAN (apa itu
-    skala, beda brand, tips memilih figure) pakai search_figure_knowledge,
-    bukan tool ini.
-
-    - query: kata kunci nama atau karakter (mis. "Luffy", "Zoro"). Kosong = semua.
-    - max_price: batas harga maksimum dalam Rupiah (mis. 500000). Opsional.
-    - min_height: tinggi minimum figure dalam cm. Opsional.
-    - max_height: tinggi maksimum figure dalam cm. Opsional.
-    - brand: filter brand persis, tidak membedakan huruf besar/kecil
-      (mis. "Bandai", "Banpresto", "MegaHouse"). Opsional.
-    - limit: jumlah maksimum hasil, default 5.
-    Mengembalikan JSON string berisi {count, results:[...]}.
-    """
-    return search_figures_tool(
-        query=query,
-        max_price=max_price,
-        min_height=min_height,
-        max_height=max_height,
-        brand=brand,
-        limit=limit,
-    )
-
-
-@mcp.tool()
 def search_onepiece_characters(query: str, top_k: int = 4) -> str:
     """
     Mencari PENGETAHUAN karakter One Piece (nama, julukan, afiliasi, peran,
@@ -243,9 +176,9 @@ def search_onepiece_characters(query: str, top_k: int = 4) -> str:
     tentang karakter, mis. "ceritakan tentang Trafalgar Law", "siapa kapten
     Beast Pirates", "karakter berbuah Logia".
 
-    Bedakan dari tool lain: untuk DATA PRODUK/beli figure pakai `search_figures`;
-    untuk pengetahuan figure (skala/brand/bahan) pakai `search_figure_knowledge`;
-    untuk keuangan pakai tool transaksi. Tool ini KHUSUS pengetahuan karakter.
+    Bedakan dari tool lain: untuk keuangan pakai tool transaksi (create/get/
+    update/delete_transaction, get_summary); untuk load test pakai tool gatling.
+    Tool ini KHUSUS pengetahuan karakter One Piece.
     - query: pertanyaan atau kata kunci pengguna.
     - top_k: jumlah karakter paling relevan (default 4).
     """
