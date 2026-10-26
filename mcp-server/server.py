@@ -46,6 +46,7 @@ from tools.gatling_tools import (
 )
 from rag.retriever import retrieve
 from tools.figure_tools import search_figures_tool
+from character_rag.retriever import retrieve as retrieve_characters
 
 # Port & path endpoint MCP HTTP streamable. Backend terhubung ke
 # http://127.0.0.1:8001/mcp sebagai MCP client (protokol MCP, bukan REST).
@@ -231,6 +232,41 @@ def search_figures(
         brand=brand,
         limit=limit,
     )
+
+
+@mcp.tool()
+def search_onepiece_characters(query: str, top_k: int = 4) -> str:
+    """
+    Mencari PENGETAHUAN karakter One Piece (nama, julukan, afiliasi, peran,
+    bounty, buah iblis, tipe buah iblis) dari basis pengetahuan RAG karakter
+    (LlamaIndex). Gunakan tool INI untuk pertanyaan deskriptif/kontekstual
+    tentang karakter, mis. "ceritakan tentang Trafalgar Law", "siapa kapten
+    Beast Pirates", "karakter berbuah Logia".
+
+    Bedakan dari tool lain: untuk DATA PRODUK/beli figure pakai `search_figures`;
+    untuk pengetahuan figure (skala/brand/bahan) pakai `search_figure_knowledge`;
+    untuk keuangan pakai tool transaksi. Tool ini KHUSUS pengetahuan karakter.
+    - query: pertanyaan atau kata kunci pengguna.
+    - top_k: jumlah karakter paling relevan (default 4).
+    """
+    try:
+        result = retrieve_characters(query, top_k)
+    except Exception as e:
+        return f"Gagal mencari pengetahuan karakter: {str(e)}"
+
+    note = result.get("note")
+    rows = result.get("results", [])
+    if not rows:
+        return note or "Tidak ada karakter relevan yang ditemukan."
+
+    lines = []
+    for i, r in enumerate(rows, 1):
+        skor = f"{r['score']:.3f}" if r.get("score") is not None else "-"
+        lines.append(
+            f"[{i}] {r.get('nama')} (ID {r.get('id')}, skor {skor})\n{r['text']}"
+        )
+    header = f"Ditemukan {len(rows)} karakter relevan:"
+    return header + "\n\n" + "\n\n".join(lines)
 
 
 # --- Gatling & RabbitMQ Load Testing Tools ---

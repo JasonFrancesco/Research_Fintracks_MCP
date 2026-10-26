@@ -34,3 +34,6 @@ backend/reports/
 gatling-runner/results/
 gatling-runner/simulations/
 gatling-runner/.scala-build/
+
+# ---- Artefak build RAG karakter (dibuat ulang oleh ingestion, bukan source) ----
+mcp-server/character_rag/storage/
