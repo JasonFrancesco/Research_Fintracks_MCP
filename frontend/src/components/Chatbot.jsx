@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import api from '../services/api';
 import dendenMushi from '../assets/den-den-mushi.jpg';
 import FigureProductCard from './FigureProductCard';
+import RagEvaluationBadge from './RagEvaluationBadge';
 
 // Konfigurasi presentasi per tema. Hanya memengaruhi tampilan header & avatar;
 // seluruh logika chat tetap sama untuk semua tema.
@@ -130,7 +131,9 @@ const Chatbot = ({ theme = 'fintracks' }) => {
     useEffect(() => {
         const fetchHistory = async () => {
             try {
-                const response = await api.get('/chat/history');
+                const response = await api.get('/chat/history', {
+                    params: { topic: isOnePiece ? 'onepiece' : 'fintracks' }
+                });
                 if (Array.isArray(response.data)) {
                     setMessages(response.data);
                 }
@@ -161,7 +164,7 @@ const Chatbot = ({ theme = 'fintracks' }) => {
 
         fetchHistory();
         fetchModels();
-    }, []);
+    }, [isOnePiece]);
 
     useEffect(() => {
         scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -191,6 +194,7 @@ const Chatbot = ({ theme = 'fintracks' }) => {
             const response = await api.post('/chat/', {
                 message: input,
                 model: selectedModel,  // preset model yang dipilih di dropdown
+                topic: isOnePiece ? 'onepiece' : 'fintracks',
                 ...(isOnePiece ? { use_rag: useRag } : {}),
             });
             // Tambahkan balasan AI ke daftar pesan supaya muncul di layar.
@@ -199,6 +203,7 @@ const Chatbot = ({ theme = 'fintracks' }) => {
                 text: response.data.response,
                 created_at: new Date().toISOString(),
                 products: isOnePiece ? (response.data.products || null) : null,
+                rag_evaluation: isOnePiece ? (response.data.rag_evaluation || null) : null,
             }]);
         } catch (error) {
             // Pesan seragam "gagal menghubungi AI" menyembunyikan penyebab sebenarnya.
@@ -224,15 +229,22 @@ const Chatbot = ({ theme = 'fintracks' }) => {
         }
     };
 
+    const handleToggleRag = () => {
+        setUseRag(prev => !prev);
+    };
+
     const handleClearHistory = async () => {
         if (!window.confirm('Apakah Anda yakin ingin menghapus seluruh riwayat chat?')) return;
         try {
-            await api.delete('/chat/history');
+            await api.delete('/chat/history', {
+                params: { topic: isOnePiece ? 'onepiece' : 'fintracks' }
+            });
             setMessages([]);
         } catch (error) {
             console.error('Gagal menghapus riwayat chat:', error);
         }
     };
+
 
     return (
         <div className="fixed bottom-24 right-6 w-96 h-[520px] bg-white rounded-2xl shadow-2xl border border-gray-200 flex flex-col overflow-hidden z-40">
@@ -303,14 +315,14 @@ const Chatbot = ({ theme = 'fintracks' }) => {
                     {isOnePiece && (
                         <div className="flex items-center justify-between text-xs gap-2 pt-1 border-t border-blue-500/40">
                             <label htmlFor="rag-toggle" className="text-blue-100 text-[11px] font-medium">
-                                RAG (pengetahuan figure)
+                                RAG (Karakter One Piece)
                             </label>
                             <button
                                 id="rag-toggle"
                                 type="button"
                                 role="switch"
                                 aria-checked={useRag}
-                                onClick={() => setUseRag(v => !v)}
+                                onClick={handleToggleRag}
                                 disabled={isLoading}
                                 className={`px-2 py-0.5 rounded text-[11px] font-semibold border focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-300 disabled:opacity-60 ${useRag ? 'bg-green-600 border-green-400 text-white' : 'bg-gray-500 border-gray-400 text-white'}`}
                             >
@@ -358,6 +370,11 @@ const Chatbot = ({ theme = 'fintracks' }) => {
                                     ))}
                                 </div>
                             )}
+                            {isOnePiece && msg.rag_evaluation && (
+                                <div className="w-[85%] self-start">
+                                    <RagEvaluationBadge evaluation={msg.rag_evaluation} />
+                                </div>
+                            )}
                         </div>
                     ))
                 )}
@@ -377,8 +394,8 @@ const Chatbot = ({ theme = 'fintracks' }) => {
                 <input
                     type="text"
                     className="flex-1 p-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    placeholder={`Tanya saldo (${selectedModel})...`}
-                    aria-label="Pesan untuk FinTracks AI"
+                    placeholder={isOnePiece ? `Tanya karakter One Piece (${selectedModel})...` : `Tanya saldo (${selectedModel})...`}
+                    aria-label={isOnePiece ? "Pesan untuk One Piece AI" : "Pesan untuk FinTracks AI"}
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     disabled={isLoading}

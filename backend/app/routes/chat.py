@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import threading
 import requests
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -20,6 +21,7 @@ class ChatRequest(BaseModel):
     message: str
     model: Optional[str] = "local"
     use_rag: Optional[bool] = None   # None = pakai default endpoint (ON)
+    topic: Optional[str] = "fintracks"
 
 class ChatResponse(BaseModel):
     model_config = {"protected_namespaces": ()}
@@ -27,6 +29,7 @@ class ChatResponse(BaseModel):
     response: str
     model_used: Optional[str] = None
     products: Optional[List[Dict[str, Any]]] = None   # default None, absen dari JSON
+    rag_evaluation: Optional[Dict[str, Any]] = None  # Metrik evaluasi RAG (persen & rumus)
 
 class ChatMessageItem(BaseModel):
     id: int
@@ -40,6 +43,12 @@ class ChatMessageItem(BaseModel):
 # Alur: HOST (file ini) -> mcp_client (CLIENT) -> MCP SERVER (mcp-server/server.py)
 from ..mcp import client as mcp_client   # CLIENT: juru bicara protokol MCP
 from ..mcp.schema_adapter import mcp_tools_to_llm_schema
+from ..rag_evaluator import (
+    run_rag_evaluation,
+    get_latest_rag_evaluation,
+    get_rag_evaluation_history,
+    get_rag_formulas,
+)
 
 # Nilai awal sebagai cadangan. JANGAN dipakai langsung untuk request: konstanta
 # modul hanya dibaca sekali saat import, sehingga perubahan .env tidak terbaca
@@ -340,9 +349,9 @@ def _mask(key: str) -> str:
         return f"{key[:3]}...({len(key)} char)"
     return f"{key[:6]}...{key[-4:]} ({len(key)} char)"
 
-def save_chat_message(db: Session, user_id: int, role: str, message: str):
+def save_chat_message(db: Session, user_id: int, role: str, message: str, topic: str = "fintracks"):
     try:
-        chat_item = ChatHistory(user_id=user_id, role=role, message=message)
+        chat_item = ChatHistory(user_id=user_id, role=role, message=message, topic=topic)
         db.add(chat_item)
         db.commit()
     except Exception as e:
@@ -351,16 +360,17 @@ def save_chat_message(db: Session, user_id: int, role: str, message: str):
 
 @router.get("/history", response_model=List[ChatMessageItem])
 async def get_chat_history(
+    topic: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Mengambil seluruh riwayat pesan chat milik user"""
-    history = (
-        db.query(ChatHistory)
-        .filter(ChatHistory.user_id == current_user.id)
-        .order_by(ChatHistory.created_at.asc())
-        .all()
-    )
+    """Mengambil riwayat pesan chat milik user sesuai topik (fintracks atau onepiece)"""
+    query = db.query(ChatHistory).filter(ChatHistory.user_id == current_user.id)
+    if topic == "onepiece":
+        query = query.filter(ChatHistory.topic == "onepiece")
+    elif topic == "fintracks":
+        query = query.filter((ChatHistory.topic == "fintracks") | (ChatHistory.topic == None))
+    history = query.order_by(ChatHistory.created_at.asc()).all()
     return [
         ChatMessageItem(
             id=item.id,
@@ -373,11 +383,17 @@ async def get_chat_history(
 
 @router.delete("/history")
 async def clear_chat_history(
+    topic: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Hapus seluruh riwayat percakapan user"""
-    db.query(ChatHistory).filter(ChatHistory.user_id == current_user.id).delete()
+    """Hapus seluruh riwayat percakapan user sesuai topik (fintracks atau onepiece)"""
+    query = db.query(ChatHistory).filter(ChatHistory.user_id == current_user.id)
+    if topic == "onepiece":
+        query = query.filter(ChatHistory.topic == "onepiece")
+    elif topic == "fintracks":
+        query = query.filter((ChatHistory.topic == "fintracks") | (ChatHistory.topic == None))
+    query.delete(synchronize_session=False)
     db.commit()
     return {"message": "Riwayat percakapan berhasil dihapus"}
 
@@ -417,6 +433,109 @@ async def get_available_models():
         options.append(item)
 
     return {"default": get_default_preset(), "models": options}
+
+
+class BenchmarkRAGRequest(BaseModel):
+    query: str
+    preset: Optional[str] = "gemini"
+
+
+@router.get("/rag-evaluation/latest")
+async def get_latest_rag_eval():
+    """Mengambil evaluasi RAG One Piece terbaru beserta rumus perhitungannya"""
+    latest = get_latest_rag_evaluation()
+    formulas = get_rag_formulas()
+    return {
+        "has_data": bool(latest),
+        "evaluation": latest,
+        "formulas_reference": formulas,
+    }
+
+
+@router.get("/rag-evaluation/history")
+async def get_rag_eval_history(limit: int = 15):
+    """Mengambil riwayat evaluasi RAG terbaru"""
+    return {
+        "history": get_rag_evaluation_history(limit=limit),
+        "formulas_reference": get_rag_formulas(),
+    }
+
+
+@router.get("/rag-evaluation/formulas")
+async def get_rag_formulas_endpoint():
+    """Mengambil rumus matematis formal 3 metrik RAG"""
+    return get_rag_formulas()
+
+
+@router.post("/rag-evaluation/benchmark")
+async def run_rag_benchmark(
+    req: BenchmarkRAGRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Menjalankan pengujian RAG One Piece secara langsung dari UI:
+    Retrieval dari Vector DB -> Sintesis LLM -> Evaluasi 3 Metrik (Persen + Rumus).
+    """
+    user_msg = req.query.strip()
+    if not user_msg:
+        raise HTTPException(status_code=400, detail="Query tidak boleh kosong")
+
+    preset_id = req.preset or "gemini"
+    preset_cfg = resolve_preset(preset_id)
+    model_label = preset_cfg["label"]
+
+    # 1. Retrieval lewat MCP tool
+    try:
+        retrieved_context = await mcp_client.call_tool(
+            "search_onepiece_characters",
+            {"query": user_msg, "top_k": 4}
+        )
+    except Exception as e:
+        retrieved_context = f"Error saat retrieval data One Piece: {e}"
+
+    context_str = str(retrieved_context or "")
+
+    # 2. Sintesis jawaban via LLM
+    synthesis_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Anda adalah One Piece AI Assistant (Den Den Mushi). Tugas Anda adalah menjawab pertanyaan "
+                "pengguna SECARA AKURAT dan EKSKLUSIF berdasarkan konteks data Ensiklopedia One Piece yang diberikan.\n\n"
+                "PEDOMAN KETAT (STRICT GROUNDING & CITATION):\n"
+                "1. Jawab HANYA dan EKSKLUSIF berdasarkan fakta yang tertulis di dalam 'Hasil Ensiklopedia Karakter' di bawah.\n"
+                "2. DILARANG menggunakan pengetahuan luar atau hafalan internal Anda di luar teks yang diberikan (cegah halusinasi).\n"
+                "3. Jika informasi spesifik yang ditanyakan TIDAK TERCATAT pada teks ensiklopedia di bawah, nyatakan secara "
+                "jujur: 'Berdasarkan dokumen ensiklopedia PDF yang tersedia, informasi mengenai hal tersebut tidak tercatat.' "
+                "Jangan mengarang jawaban.\n"
+                "4. WAJIB menyertakan kutipan nomor halaman [Halaman X] di setiap fakta/klaim yang Anda sebutkan."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Pertanyaan Pengguna: '{user_msg}'\nHasil Ensiklopedia Karakter:\n{context_str}",
+        },
+    ]
+
+    synth_resp, _ = query_llm(preset_id, synthesis_messages)
+    answer = synth_resp.get("content", "") if synth_resp else "Gagal menghasilkan jawaban dari LLM."
+
+    # 3. Hitung evaluasi 3 metrik (Persentase + Rumus)
+    eval_result = run_rag_evaluation(
+        question=user_msg,
+        context=context_str,
+        answer=answer,
+        model_label=model_label,
+    )
+
+    return {
+        "query": user_msg,
+        "answer": answer,
+        "retrieved_context": context_str,
+        "model_used": model_label,
+        "evaluation": eval_result,
+        "formulas_reference": get_rag_formulas(),
+    }
 
 
 @router.get("/diagnose")
@@ -590,7 +709,7 @@ def get_active_model() -> str:
         raw = "ollama/llama3.2"
     return raw.split("/", 1)[1] if "/" in raw else raw
 
-def query_llm(preset_id: str, messages: list, tools: list = None) -> tuple[Optional[dict], Optional[str]]:
+def query_llm(preset_id: str, messages: list, tools: list = None, tool_choice: str = "auto") -> tuple[Optional[dict], Optional[str]]:
     """
     Mengirimkan request ke LLM sesuai preset yang dipilih user di dropdown Chatbot.
     Return: (ai_message_dict, error_string)
@@ -634,7 +753,7 @@ def query_llm(preset_id: str, messages: list, tools: list = None) -> tuple[Optio
             payload["max_tokens"] = max_tokens
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = tool_choice or "auto"
 
         cloud_timeout = get_cloud_timeout()
         try:
@@ -942,6 +1061,8 @@ def sanitize_tool_args(tool_name: str, args: dict, user_id: int, user_msg: str) 
     # Tool pengetahuan karakter tidak memerlukan user_id dan tidak punya
     # sanitasi khusus. Kembalikan argumen apa adanya SEBELUM injeksi user_id.
     if tool_name == "search_onepiece_characters":
+        if not args.get("query"):
+            args["query"] = user_msg
         return args
 
     args["user_id"] = user_id
@@ -1090,71 +1211,100 @@ async def chat_with_ai(
     today_str = datetime.now().strftime("%Y-%m-%d")
     use_rag = True if request.use_rag is None else bool(request.use_rag)
 
-    # 1. Simpan pesan user ke database (untuk riwayat & memory percakapan)
-    save_chat_message(db, user_id, "user", user_msg)
+    # Identifikasi topik/konteks secara tegas: 'onepiece' atau 'fintracks'
+    current_topic = request.topic or ("onepiece" if request.use_rag is not None and request.use_rag else "fintracks")
+    if current_topic not in ("onepiece", "fintracks"):
+        current_topic = "fintracks"
 
-    # 2. Ambil riwayat percakapan sebelumnya untuk konteks memory AI (maks 10 pesan terakhir)
+    # 1. Simpan pesan user ke database terpisah per topik
+    save_chat_message(db, user_id, "user", user_msg, topic=current_topic)
+
+    # 2. Ambil riwayat percakapan sebelumnya HANYA untuk topik yang sama (maks 10 pesan terakhir)
+    # Ini krusial agar penolakan keuangan lama tidak mencemari percakapan One Piece (dan sebaliknya).
+    history_query = db.query(ChatHistory).filter(ChatHistory.user_id == user_id)
+    if current_topic == "onepiece":
+        history_query = history_query.filter(ChatHistory.topic == "onepiece")
+    else:
+        history_query = history_query.filter((ChatHistory.topic == "fintracks") | (ChatHistory.topic == None))
+
     past_history = (
-        db.query(ChatHistory)
-        .filter(ChatHistory.user_id == user_id)
+        history_query
         .order_by(ChatHistory.created_at.desc())
         .limit(10)
         .all()
     )
     past_history.reverse()
 
-    system_prompt = (
-        f"Anda adalah FinTracks AI Assistant, asisten keuangan pribadi yang cerdas.\n"
-        f"User ID: {user_id}. Tanggal hari ini: {today_str}.\n"
-        f"Anda memiliki akses ke MCP Tools untuk mengelola data keuangan pengguna:\n"
-        f"- create_transaction: Mencatat transaksi baru (pemasukan/pengeluaran).\n"
-        f"- get_transactions: Melihat riwayat transaksi. Jika pengguna menyebut tanggal atau "
-        f"jenis (pemasukan/pengeluaran), WAJIB isi start_date/end_date dan transaction_type. "
-        f"Jika pengguna menyebut tanggal tanpa bulan (contoh 'tanggal 29'), pakai tanggal 29 "
-        f"terdekat yang SUDAH LEWAT dari hari ini, jangan tanggal di masa depan.\n"
-        f"- get_summary: Melihat ringkasan pemasukan, pengeluaran, dan saldo.\n"
-        f"- update_transaction: Mengubah transaksi yang sudah ada.\n"
-        f"- delete_transaction: Menghapus transaksi.\n\n"
-        f"ATURAN KETAT PENGGUNAAN TOOL:\n"
-        f"1. JANGAN PERNAH memanggil 'create_transaction' jika pengguna hanya BERTANYA, BERKONSULTASI, meminta kalkulasi, atau bertanya hipotetis (contoh: 'berapa pemasukan yang harus saya dapatkan...', 'bagaimana menutupi utang').\n"
-        f"2. Panggil 'create_transaction' HANYA JIKA pengguna secara EKSPLISIT memerintahkan untuk MENCATAT/INPUT transaksi baru (contoh perintah: 'catat...', 'tambah...', 'saya baru saja beli...', 'masukkan pengeluaran...').\n"
-        f"3. Jika pengguna bertanya tentang kondisi keuangan atau analisis saldo/utang, gunakan 'get_summary' atau 'get_transactions' untuk memeriksa data tanpa menambah transaksi baru.\n"
-        f"4. Untuk 'update_transaction', pengguna TIDAK perlu menyebut ID. Jika ID tidak diketahui, "
-        f"isi 'match_title' dengan kata kunci judul transaksi dan/atau 'match_date' dengan tanggalnya, "
-        f"lalu kirim nilai barunya pada parameter yang sesuai. Contoh: 'ubah transaksi kopi jadi 30rb' "
-        f"menjadi match_title='kopi' dan amount=30000. Jangan pernah menebak angka ID.\n"
-        f"5. Jika hasil 'update_transaction' berisi beberapa kandidat transaksi, sampaikan daftar kandidat "
-        f"beserta ID-nya kepada pengguna dan minta pengguna memilih. Jangan mengulang update dengan ID tebakan.\n"
-        f"6. Jawablah dengan bahasa Indonesia yang ramah, sopan, dan jelas."
-        f"7. AI Models harus pintar dan jelas dalam memutuskan tool mana yang dipanggil kemudian harus menjawab dengan jelas."
-    )
-
-    system_prompt += (
-        "\n\nTOOL PENGETAHUAN KARAKTER ONE PIECE:\n"
-        "- search_onepiece_characters: mencari PENGETAHUAN karakter One Piece "
-        "(nama, julukan, afiliasi, kru/bajak laut, peran, bounty, buah iblis/"
-        "devil fruit, tipe buah iblis) dari basis pengetahuan RAG karakter. "
-        "Tool ini HANYA tersedia bila RAG aktif.\n"
-        "ATURAN KARAKTER ONE PIECE:\n"
-        "A. Untuk pertanyaan APA PUN tentang karakter One Piece (siapa, julukan, "
-        "afiliasi, kru/bajak laut mana, peran, berapa bounty, buah iblis apa, "
-        "tipe buah iblis), WAJIB panggil search_onepiece_characters dengan "
-        "query berisi pertanyaan pengguna. JANGAN menjawab dari ingatan model.\n"
-        "B. Susun jawaban HANYA berdasarkan konteks yang dikembalikan tool. "
-        "Jika tool tidak mengembalikan informasi yang relevan, katakan terus "
-        "terang bahwa Anda tidak tahu. JANGAN mengarang atau menebak fakta.\n"
-        "C. JANGAN memanggil search_onepiece_characters untuk pertanyaan "
-        "keuangan/transaksi atau gatling/load test. Tool karakter dan tool "
-        "keuangan/gatling tidak boleh dicampur dalam satu jawaban."
-    )
-
+    # 3. System Prompt terpisah per konteks proyek
+    if current_topic == "onepiece":
+        system_prompt = (
+            f"Anda adalah One Piece AI Assistant (Den Den Mushi), asisten ensiklopedia cerdas khusus dunia anime dan manga One Piece.\n"
+            f"Tanggal hari ini: {today_str}.\n"
+        )
+        if use_rag:
+            system_prompt += (
+                f"Anda memiliki akses ke MCP Tool 'search_onepiece_characters' untuk mencari data karakter One Piece "
+                f"(nama, julukan, afiliasi, peran, asal usul, bounty, buah iblis, senjata/kemampuan, serta biografi kisah & rekam jejak sejarah) "
+                f"dari basis pengetahuan RAG dokumen PDF resmi ('Ensiklopedia Arsip Data 50 Karakter One Piece').\n\n"
+                f"ATURAN UTAMA:\n"
+                f"1. Untuk pertanyaan APA PUN tentang karakter One Piece (siapa dia, julukan, afiliasi, peran, asal usul, "
+                f"berapa bounty, buah iblis, senjata, kisah/biografi sejarah), WAJIB panggil tool 'search_onepiece_characters' "
+                f"dengan query berupa kata kunci atau nama karakter yang ditanyakan.\n"
+                f"2. Jawablah HANYA berdasarkan konteks yang dikembalikan oleh tool dari dokumen PDF secara ramah, seru, dan faktual dalam Bahasa Indonesia. Sertakan detail seperti kisah & rekam jejak, asal-usul, dan senjata/kemampuan yang tercantum di PDF bila relevan.\n"
+                f"3. DILARANG menjawab langsung dari ingatan internal Anda tanpa memanggil tool! Anda WAJIB memanggil tool terlebih dahulu.\n"
+                f"4. Jika data tidak ditemukan di dokumen PDF ensiklopedia, sampaikan dengan jujur bahwa karakter tersebut belum tercatat dalam dokumen PDF ensiklopedia."
+            )
+        else:
+            system_prompt += (
+                f"Fitur RAG saat ini dinonaktifkan (OFF). Jawablah pertanyaan seputar One Piece semampu Anda murni menggunakan "
+                f"pengetahuan dasar internal model Anda sendiri tanpa mengambil data dari ensiklopedia luar."
+            )
+    else:
+        system_prompt = (
+            f"Anda adalah FinTracks AI Assistant, asisten keuangan pribadi yang cerdas.\n"
+            f"User ID: {user_id}. Tanggal hari ini: {today_str}.\n"
+            f"Anda memiliki akses ke MCP Tools untuk mengelola data keuangan pengguna:\n"
+            f"- create_transaction: Mencatat transaksi baru (pemasukan/pengeluaran).\n"
+            f"- get_transactions: Melihat riwayat transaksi. Jika pengguna menyebut tanggal atau "
+            f"jenis (pemasukan/pengeluaran), WAJIB isi start_date/end_date dan transaction_type. "
+            f"Jika pengguna menyebut tanggal tanpa bulan (contoh 'tanggal 29'), pakai tanggal 29 "
+            f"terdekat yang SUDAH LEWAT dari hari ini, jangan tanggal di masa depan.\n"
+            f"- get_summary: Melihat ringkasan pemasukan, pengeluaran, dan saldo.\n"
+            f"- update_transaction: Mengubah transaksi yang sudah ada.\n"
+            f"- delete_transaction: Menghapus transaksi.\n\n"
+            f"ATURAN KETAT PENGGUNAAN TOOL:\n"
+            f"1. JANGAN PERNAH memanggil 'create_transaction' jika pengguna hanya BERTANYA, BERKONSULTASI, meminta kalkulasi, atau bertanya hipotetis (contoh: 'berapa pemasukan yang harus saya dapatkan...', 'bagaimana menutupi utang').\n"
+            f"2. Panggil 'create_transaction' HANYA JIKA pengguna secara EKSPLISIT memerintahkan untuk MENCATAT/INPUT transaksi baru (contoh perintah: 'catat...', 'tambah...', 'saya baru saja beli...', 'masukkan pengeluaran...').\n"
+            f"3. Jika pengguna bertanya tentang kondisi keuangan atau analisis saldo/utang, gunakan 'get_summary' atau 'get_transactions' untuk memeriksa data tanpa menambah transaksi baru.\n"
+            f"4. Untuk 'update_transaction', pengguna TIDAK perlu menyebut ID. Jika ID tidak diketahui, "
+            f"isi 'match_title' dengan kata kunci judul transaksi dan/atau 'match_date' dengan tanggalnya, "
+            f"lalu kirim nilai barunya pada parameter yang sesuai. Contoh: 'ubah transaksi kopi jadi 30rb' "
+            f"menjadi match_title='kopi' dan amount=30000. Jangan pernah menebak angka ID.\n"
+            f"5. Jika hasil 'update_transaction' berisi beberapa kandidat transaksi, sampaikan daftar kandidat "
+            f"beserta ID-nya kepada pengguna dan minta pengguna memilih. Jangan mengulang update dengan ID tebakan.\n"
+            f"6. Jawablah dengan bahasa Indonesia yang ramah, sopan, dan jelas.\n"
+            f"7. AI Models harus pintar dan jelas dalam memutuskan tool mana yang dipanggil kemudian harus menjawab dengan jelas."
+        )
+        if use_rag:
+            system_prompt += (
+                "\n\nTOOL PENGETAHUAN KARAKTER ONE PIECE:\n"
+                "- search_onepiece_characters: mencari data/ensiklopedia karakter One Piece "
+                "(nama, julukan, afiliasi, kru, peran, bounty, buah iblis). "
+                "Jika pengguna bertanya tentang karakter One Piece, panggil tool ini."
+            )
 
     # Susun daftar pesan untuk LLM: system prompt dulu, lalu riwayat lama,
     # terakhir pesan user saat ini. Format {role, content} ini standar chat LLM.
     messages = [{"role": "system", "content": system_prompt}]
-    for rec in past_history[:-1]:  # [:-1] = kecualikan pesan user terakhir (ditambah manual di bawah)
-        o_role = "user" if rec.role == "user" else "assistant"
-        messages.append({"role": o_role, "content": rec.message})
+
+    # Untuk topik onepiece (benchmark ensiklopedia karakter), kita tidak menyertakan
+    # riwayat jawaban sebelumnya ke LLM prompt. Ini mencegah model "menyontek" atau
+    # mengulang jawaban RAG sebelumnya saat user berganti toggle ON/OFF,
+    # sementara SEMUA pesan chat tetap utuh tampil di layar frontend dan tersimpan di database.
+    if current_topic != "onepiece":
+        for rec in past_history[:-1]:  # [:-1] = kecualikan pesan user terakhir (ditambah manual di bawah)
+            o_role = "user" if rec.role == "user" else "assistant"
+            messages.append({"role": o_role, "content": rec.message})
 
     messages.append({"role": "user", "content": user_msg})
 
@@ -1165,33 +1315,48 @@ async def chat_with_ai(
         mcp_tools = await mcp_client.list_tools()
         tools_schema = mcp_tools_to_llm_schema(mcp_tools)
     except Exception as e:
-        # Server MCP mati/putus: jangan crash. LLM tetap bisa menjawab percakapan
-        # umum tanpa tool, dan error-nya transparan di log.
         print(f"[MCP] Gagal mengambil daftar tool dari server MCP: {type(e).__name__}: {e}")
         tools_schema = []
 
-    # RAG OFF: sembunyikan HANYA tool pengetahuan RAG karakter; tool lain
-    # (transaksi & gatling) tetap utuh. Dengan tool karakter disembunyikan,
-    # LLM terpaksa menjawab dari ingatannya sendiri -> berguna untuk demo
-    # perbandingan RAG ON vs OFF. Filter dilakukan di sisi HOST, bukan server.
-    if not use_rag:
-        tools_schema = [
-            t for t in tools_schema
-            if t.get("function", {}).get("name") != "search_onepiece_characters"
-        ]
+    # Tool filtering: tidak dibatasi per topik agar model bebas memilih tool yang sesuai dengan kebutuhan pesan pengguna.
+    # Pembatasan tool PER TOPIK agar model tidak salah memanggil tool lintas-domain.
+    # - Topik 'onepiece': satu-satunya tool relevan adalah search_onepiece_characters,
+    #   dan HANYA bila RAG ON. Kalau RAG OFF, tidak ada tool sama sekali -> AI menjawab
+    #   murni dari pengetahuannya. Tool keuangan/gatling disembunyikan di topik ini
+    #   supaya model (terutama model lokal kecil) tidak iseng memanggil get_summary dll.
+    # - Topik 'fintracks': pakai tool keuangan/gatling, tapi sembunyikan tool RAG
+    #   One Piece kecuali RAG ON (agar bisa tanya karakter dari dalam konteks fintracks).
+    RAG_TOOL = "search_onepiece_characters"
+    if current_topic == "onepiece":
+        if use_rag:
+            tools_schema = [t for t in tools_schema
+                            if t.get("function", {}).get("name") == RAG_TOOL]
+        else:
+            tools_schema = []
+    else:
+        if not use_rag:
+            tools_schema = [t for t in tools_schema
+                            if t.get("function", {}).get("name") != RAG_TOOL]
+
+    # Tentukan tool_choice: jika RAG One Piece aktif dan bukan sekadar salam, wajibkan pemanggilan tool
+    tool_choice_mode = "auto"
+    if current_topic == "onepiece" and use_rag and tools_schema:
+        greetings = ["halo", "hai", "hi", "hello", "hey", "hei", "pagi", "siang", "sore", "malam", "tes", "test", "ping"]
+        clean_msg = user_msg.strip().lower()
+        is_greeting = any(clean_msg == g or clean_msg.startswith(g + " ") for g in greetings) and len(clean_msg.split()) <= 3
+        if not is_greeting:
+            tool_choice_mode = "required"
 
     # Step 1: Panggil LLM RONDE 1 = tahap KEPUTUSAN.
-    # LLM melihat pesan + daftar tool, lalu memutuskan: jawab langsung, atau
-    # panggil tool tertentu dengan argumen apa.
-    print(f"\n{'=' * 78}\n[BENCHMARK] preset={model_label} | history={len(messages) - 2} pesan | tools={len(tools_schema)}\n[BENCHMARK] prompt: {user_msg!r}")
-    t_start = time.perf_counter()  # mulai hitung waktu untuk log BENCHMARK
-    ai_resp, err_msg = query_llm(model_mode, messages, tools_schema)
+    print(f"\n{'=' * 78}\n[BENCHMARK] preset={model_label} | topic={current_topic} | history={len(messages) - 2} pesan | tools={len(tools_schema)} | tool_choice={tool_choice_mode}\n[BENCHMARK] prompt: {user_msg!r}")
+    t_start = time.perf_counter()
+    ai_resp, err_msg = query_llm(model_mode, messages, tools_schema, tool_choice=tool_choice_mode)
     t_decide = time.perf_counter() - t_start
 
     # Kalau LLM gagal dihubungi (timeout, API key salah, dll), hentikan di sini.
     if err_msg:
         print(f"[BENCHMARK] GAGAL setelah {t_decide:.1f}s: {err_msg.splitlines()[0]}")
-        save_chat_message(db, user_id, "ai", err_msg)
+        save_chat_message(db, user_id, "ai", err_msg, topic=current_topic)
         return ChatResponse(response=err_msg, model_used=model_label)
 
     # tool_calls = daftar tool yang diminta LLM. Kosong = LLM mau jawab langsung.
@@ -1200,85 +1365,168 @@ async def chat_with_ai(
     if not tool_calls:
         print("[BENCHMARK] tool dipilih: (tidak ada, dijawab langsung)")
 
+    # AUTO-FALLBACK RAG: Model lokal kecil (seperti ministral:3b, llama3.2, gemma)
+    # sering gagal memicu mekanisme function calling resmi.
+    # Jika mode RAG sedang ON dan topik adalah onepiece, paksa eksekusi tool
+    # search_onepiece_characters agar pengetahuan PDF tetap terambil dan AI tidak berhalusinasi.
+    if not tool_calls and current_topic == "onepiece" and use_rag:
+        greetings = ["halo", "hai", "hi", "hello", "hey", "hei", "pagi", "siang", "sore", "malam", "tes", "test", "ping"]
+        clean_msg = user_msg.strip().lower()
+        is_greeting = any(clean_msg == g or clean_msg.startswith(g + " ") for g in greetings) and len(clean_msg.split()) <= 3
+        if not is_greeting:
+            print(f"[RAG Intercept] Model '{model_label}' tidak memanggil tool. Memaksa pencarian RAG untuk: {user_msg!r}")
+            tool_calls = [{"function": {"name": "search_onepiece_characters", "arguments": {"query": user_msg, "top_k": 4}}}]
+
+    # Jaring pengaman RAG OFF: meski tool RAG sudah dibuang dari schema, model lokal
+    # kecil kadang tetap "memaksa" memanggil search_onepiece_characters (lewat
+    # recovery tool-call dari teks, atau dari ingatannya). Bila RAG dimatikan,
+    # buang panggilan itu di titik eksekusi agar AI benar-benar menjawab dari
+    # kemampuannya sendiri, bukan dari ensiklopedia.
+    if not use_rag and tool_calls:
+        before = len(tool_calls)
+        tool_calls = [
+            tc for tc in tool_calls
+            if tc.get("function", {}).get("name") != "search_onepiece_characters"
+        ]
+        if len(tool_calls) != before:
+            print(f"[RAG OFF] Memblokir pemanggilan 'search_onepiece_characters' "
+                  f"karena toggle RAG dimatikan ({before - len(tool_calls)} panggilan dibuang).")
+
     # Step 2: LLM memutuskan memanggil tool -> jalankan tool-nya lewat MCP.
     if tool_calls:
         tool_outputs = []
-        executed_tool_names = []   # paralel dengan tool_outputs
+        executed_tool_names = []
 
-        # LLM bisa meminta lebih dari satu tool; proses satu per satu.
         for idx, tool_call in enumerate(tool_calls, start=1):
-            fn_name = tool_call.get("function", {}).get("name")       # nama tool, mis. "get_transactions"
-            fn_args = tool_call.get("function", {}).get("arguments", {})  # argumen pilihan LLM
+            fn_name = tool_call.get("function", {}).get("name")
+            fn_args = tool_call.get("function", {}).get("arguments", {})
 
-            # RAW ARGS = output murni model sebelum ditambal sanitize_tool_args.
-            # Inilah data yang dipakai untuk menilai kecerdasan model apa adanya.
             print(f"[BENCHMARK]   tool #{idx}: {fn_name}")
             print(f"[BENCHMARK]     RAW dari model : {json.dumps(fn_args, ensure_ascii=False, default=str)}")
 
-            # Perbaiki & lengkapi argumen: suntik user_id, koreksi tanggal/jenis
-            # yang sering salah pada model kecil. (lihat fungsi sanitize_tool_args)
             sanitized_args = sanitize_tool_args(fn_name, fn_args, user_id, user_msg)
             print(f"[BENCHMARK]     setelah sanitize: {json.dumps(sanitized_args, ensure_ascii=False, default=str)}")
 
-            # Eksekusi tool di server MCP lewat protokol MCP (tools/call), bukan REST.
-            # Di dalam sinilah query/update ke database PostgreSQL terjadi.
             try:
                 mcp_result = await mcp_client.call_tool(fn_name, sanitized_args)
             except Exception as e:
-                # Server MCP mati/putus: beri pesan, jangan sampai request crash.
                 print(f"[MCP] Gagal memanggil tool '{fn_name}': {type(e).__name__}: {e}")
                 mcp_result = f"Gagal terhubung ke MCP Server saat memanggil '{fn_name}': {e}"
             print(f"[BENCHMARK]     hasil MCP      : {str(mcp_result)[:160]}")
             tool_outputs.append(str(mcp_result or "Operasi MCP selesai."))
             executed_tool_names.append(fn_name)
 
-        # Katalog produk figure sudah dihapus, jadi tidak ada lagi daftar produk
-        # yang dikirim ke frontend. Field 'products' dipertahankan di ChatResponse
-        # demi kompatibilitas, tetapi selalu None.
         products = None
 
         # Step 3: Panggil LLM RONDE 2 = tahap SINTESIS.
-        # Hasil mentah dari tool (mis. "Ditemukan 2 pemasukan...") diubah jadi
-        # kalimat yang ramah dan enak dibaca. Seluruh output tool digabungkan
-        # (berlabel per tool) agar hasil produk dan pengetahuan ikut dirangkai.
         combined_tool_output = "\n\n".join(
             f"[Hasil tool: {name}]\n{out}"
             for name, out in zip(executed_tool_names, tool_outputs)
         )
-        synthesis_messages = [
-            {
-                "role": "system", 
-                "content": "Anda adalah FinTracks AI Assistant. Tugas Anda adalah menyampaikan hasil eksekusi MCP Tool kepada pengguna secara ramah, sopan, rapi, dan jelas dalam Bahasa Indonesia. Jawab HANYA berdasarkan hasil tool; bila beberapa tool dipakai, gabungkan seluruh hasilnya menjadi satu jawaban yang utuh. Jika hasil tool menyatakan data tidak ditemukan, sampaikan apa adanya dan jangan mengarang."
-            },
-            {
-                "role": "user", 
-                "content": f"Pesan Pengguna: '{user_msg}'\nHasil Eksekusi MCP Tool:\n{combined_tool_output}"
-            }
-        ]
+        if current_topic == "onepiece":
+            synthesis_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Anda adalah One Piece AI Assistant (Den Den Mushi). Tugas Anda adalah menyampaikan informasi karakter "
+                        "One Piece kepada pengguna secara ramah, seru, dan jelas dalam Bahasa Indonesia berdasarkan data ensiklopedia RAG.\n\n"
+                        "PEDOMAN KETAT (STRICT GROUNDING & CITATION):\n"
+                        "1. Jawab HANYA dan EKSKLUSIF berdasarkan fakta yang tertulis di dalam 'Hasil Ensiklopedia Karakter' di bawah.\n"
+                        "2. JANGAN PERNAH menggunakan pengetahuan luar atau ingatan pre-training Anda di luar konteks yang diberikan.\n"
+                        "3. Jika informasi yang ditanyakan pengguna TIDAK ADA atau TIDAK LENGKAP di dalam hasil ensiklopedia, sampaikan "
+                        "secara jujur dan terbuka: 'Berdasarkan data ensiklopedia PDF yang tersedia, informasi mengenai hal tersebut tidak ditemukan.' "
+                        "Jangan berspekulasi atau mengarang fakta.\n"
+                        "4. Cantumkan referensi nomor halaman dokumen PDF, misalnya [Halaman X], pada setiap pernyataan fakta "
+                        "(seperti nilai bounty, asal usul, peran, buah iblis, atau kisah) agar pengguna dapat memverifikasi sumbernya."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Pertanyaan Pengguna: '{user_msg}'\nHasil Ensiklopedia Karakter:\n{combined_tool_output}"
+                }
+            ]
+        else:
+            synthesis_messages = [
+                {
+                    "role": "system", 
+                    "content": "Anda adalah FinTracks AI Assistant. Tugas Anda adalah menyampaikan hasil eksekusi MCP Tool kepada pengguna secara ramah, sopan, rapi, dan jelas dalam Bahasa Indonesia. Jawab HANYA berdasarkan hasil tool; bila beberapa tool dipakai, gabungkan seluruh hasilnya menjadi satu jawaban yang utuh. Jika hasil tool menyatakan data tidak ditemukan, sampaikan apa adanya dan jangan mengarang."
+                },
+                {
+                    "role": "user", 
+                    "content": f"Pesan Pengguna: '{user_msg}'\nHasil Eksekusi MCP Tool:\n{combined_tool_output}"
+                }
+            ]
 
         # Ronde 2 tidak diberi daftar tool, jadi LLM murni merangkai kalimat.
         synth_resp, _ = query_llm(model_mode, synthesis_messages)
         print(f"[BENCHMARK] total waktu {time.perf_counter() - t_start:.1f}s (keputusan + eksekusi + sintesis)\n{'=' * 78}")
         if synth_resp and synth_resp.get("content"):
             final_ai_msg = synth_resp["content"]
-            save_chat_message(db, user_id, "ai", final_ai_msg)  # simpan jawaban ke riwayat
-            return ChatResponse(response=final_ai_msg, model_used=model_label, products=products)  # <-- balik ke frontend
+            if current_topic == "onepiece" and use_rag:
+                final_ai_msg += "\n\n---\n*📚 Data diverifikasi dari Ensiklopedia RAG Karakter (Vector DB)*"
+            save_chat_message(db, user_id, "ai", final_ai_msg, topic=current_topic)
 
-        # Cadangan: kalau sintesis gagal, tampilkan saja hasil mentah tool apa adanya.
-        fallback_ai_msg = f"🤖 **FinTracks AI Assistant:**\n\n" + "\n\n".join(tool_outputs)
-        save_chat_message(db, user_id, "ai", fallback_ai_msg)
-        return ChatResponse(response=fallback_ai_msg, model_used=model_label, products=products)
+            # 🔬 RAG Evaluation: Hitung metrik kualitas RAG (Persentase & Rumus)
+            rag_eval_data = None
+            if current_topic == "onepiece" and use_rag:
+                try:
+                    rag_eval_data = run_rag_evaluation(
+                        question=user_msg,
+                        context=combined_tool_output,
+                        answer=final_ai_msg,
+                        model_label=model_label,
+                    )
+                except Exception as e:
+                    print(f"[RAG EVAL] Error saat evaluasi: {type(e).__name__}: {e}")
 
-    # Step 4: LLM tidak butuh tool (sapaan / pertanyaan umum) -> pakai jawaban ronde 1.
+            return ChatResponse(
+                response=final_ai_msg,
+                model_used=model_label,
+                products=products,
+                rag_evaluation=rag_eval_data,
+            )
+
+        prefix = "🐌 **One Piece AI:**" if current_topic == "onepiece" else "🤖 **FinTracks AI Assistant:**"
+        fallback_ai_msg = f"{prefix}\n\n" + "\n\n".join(tool_outputs)
+        if current_topic == "onepiece" and use_rag:
+            fallback_ai_msg += "\n\n---\n*📚 Data diverifikasi dari Ensiklopedia RAG Karakter (Vector DB)*"
+        save_chat_message(db, user_id, "ai", fallback_ai_msg, topic=current_topic)
+
+        # 🔬 RAG Evaluation untuk fallback response
+        rag_eval_data = None
+        if current_topic == "onepiece" and use_rag:
+            try:
+                rag_eval_data = run_rag_evaluation(
+                    question=user_msg,
+                    context=combined_tool_output,
+                    answer=fallback_ai_msg,
+                    model_label=model_label,
+                )
+            except Exception as e:
+                print(f"[RAG EVAL] Error saat evaluasi: {type(e).__name__}: {e}")
+
+        return ChatResponse(
+            response=fallback_ai_msg,
+            model_used=model_label,
+            products=products,
+            rag_evaluation=rag_eval_data,
+        )
+
+    # Step 4: LLM tidak butuh tool (sapaan / pertanyaan umum / RAG OFF) -> pakai jawaban ronde 1.
     direct_response = ai_resp.get("content", "")
     if direct_response:
-        save_chat_message(db, user_id, "ai", direct_response)
+        if current_topic == "onepiece":
+            if not use_rag:
+                direct_response += "\n\n---\n*⚡ Mode RAG Nonaktif: Dijawab berdasarkan pengetahuan umum model AI*"
+            else:
+                direct_response += "\n\n---\n*💡 Mode RAG Aktif*"
+        save_chat_message(db, user_id, "ai", direct_response, topic=current_topic)
         return ChatResponse(response=direct_response, model_used=model_label)
 
-    # Pengaman terakhir: LLM tidak memanggil tool DAN tidak memberi teks apa pun.
-    empty_ai_msg = "🤖 **FinTracks AI Assistant:** Maaf, saya tidak dapat memahami permintaan Anda."
-    save_chat_message(db, user_id, "ai", empty_ai_msg)
+    # Pengaman terakhir
+    empty_prefix = "🐌 **One Piece AI:**" if current_topic == "onepiece" else "🤖 **FinTracks AI Assistant:**"
+    empty_ai_msg = f"{empty_prefix} Maaf, saya tidak dapat memahami permintaan Anda."
+    save_chat_message(db, user_id, "ai", empty_ai_msg, topic=current_topic)
     return ChatResponse(response=empty_ai_msg, model_used=model_label)
-
 
 

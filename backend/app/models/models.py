@@ -42,6 +42,7 @@ class ChatHistory(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     role = Column(String, nullable=False) # 'user' or 'ai'
     message = Column(Text, nullable=False)
+    topic = Column(String(50), default="fintracks", nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # Relationship to user

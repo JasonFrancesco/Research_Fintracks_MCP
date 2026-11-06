@@ -9,4 +9,6 @@ python-dotenv
 pgvector
 llama-index
 llama-index-embeddings-huggingface
+llama-index-vector-stores-postgres
 sentence-transformers
+pypdf

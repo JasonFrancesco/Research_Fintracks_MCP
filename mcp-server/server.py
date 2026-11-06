@@ -171,34 +171,34 @@ def get_summary(user_id: int) -> str:
 def search_onepiece_characters(query: str, top_k: int = 4) -> str:
     """
     Mencari PENGETAHUAN karakter One Piece (nama, julukan, afiliasi, peran,
-    bounty, buah iblis, tipe buah iblis) dari basis pengetahuan RAG karakter
-    (LlamaIndex). Gunakan tool INI untuk pertanyaan deskriptif/kontekstual
-    tentang karakter, mis. "ceritakan tentang Trafalgar Law", "siapa kapten
-    Beast Pirates", "karakter berbuah Logia".
+    asal usul, bounty, buah iblis, senjata/kekuatan, serta biografi kisah & rekam jejak sejarah)
+    dari dokumen PDF Ensiklopedia Karakter One Piece melalui basis pengetahuan RAG (LlamaIndex + BAAI/bge-m3).
+    Gunakan tool INI untuk pertanyaan deskriptif/kontekstual tentang karakter One Piece berdasarkan dokumen PDF.
 
     Bedakan dari tool lain: untuk keuangan pakai tool transaksi (create/get/
     update/delete_transaction, get_summary); untuk load test pakai tool gatling.
-    Tool ini KHUSUS pengetahuan karakter One Piece.
+    Tool ini KHUSUS pengetahuan karakter One Piece dari dokumen PDF.
     - query: pertanyaan atau kata kunci pengguna.
     - top_k: jumlah karakter paling relevan (default 4).
     """
     try:
         result = retrieve_characters(query, top_k)
     except Exception as e:
-        return f"Gagal mencari pengetahuan karakter: {str(e)}"
+        return f"Gagal mencari pengetahuan karakter dari dokumen PDF: {str(e)}"
 
     note = result.get("note")
     rows = result.get("results", [])
     if not rows:
-        return note or "Tidak ada karakter relevan yang ditemukan."
+        return note or "Tidak ada karakter relevan yang ditemukan dalam dokumen PDF."
 
     lines = []
     for i, r in enumerate(rows, 1):
         skor = f"{r['score']:.3f}" if r.get("score") is not None else "-"
+        hal = f", Halaman PDF {r.get('halaman')}" if r.get("halaman") else ""
         lines.append(
-            f"[{i}] {r.get('nama')} (ID {r.get('id')}, skor {skor})\n{r['text']}"
+            f"[{i}] {r.get('nama')} (ID {r.get('id')}{hal}, skor relevansi {skor})\n{r['text']}"
         )
-    header = f"Ditemukan {len(rows)} karakter relevan:"
+    header = f"Ditemukan {len(rows)} data karakter relevan dari Dokumen PDF Ensiklopedia One Piece:"
     return header + "\n\n" + "\n\n".join(lines)
 
 
